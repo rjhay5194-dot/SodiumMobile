@@ -222,7 +222,7 @@ jobs:
       - name: Collect jar
         run: |
           mkdir out
-          JAR=$(ls sodium-mc1.21.11-0.8.14/fabric/build/libs/*.jar | grep -v -e sources -e dev -e javadoc | head -1)
+          JAR=$(ls sodium-mc1.21.11-0.8.14/build/mods/*.jar | head -1)
           cp "$JAR" out/sodium-mobile-1.0-mc1.21.11.jar
       - name: Upload jar
         uses: actions/upload-artifact@v4
