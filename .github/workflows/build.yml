@@ -1,0 +1,231 @@
+name: Build Sodium Mobile
+# One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+      - name: Download source and apply mobile patch
+        run: |
+          curl -fL -o src.zip https://github.com/CaffeineMC/sodium/archive/refs/tags/mc1.21.11-0.8.14.zip
+          unzip -q src.zip
+          cat > mobile.patch <<'PATCH_EOF'
+          diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumConfigBuilder.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumConfigBuilder.java
+          --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumConfigBuilder.java	2026-09-30 09:51:54.810175340 +0000
+          +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumConfigBuilder.java	2026-09-30 09:51:54.919978860 +0000
+          @@ -632,6 +632,38 @@
+
+                   performancePage.addOptionGroup(builder.createOptionGroup()
+                           .addOption(
+          +                        builder.createIntegerOption(Identifier.parse("sodium:performance.mobile_upload_budget"))
+          +                                .setStorageHandler(this.sodiumStorage)
+          +                                .setName(Component.translatable("sodium.options.mobile_upload_budget.name"))
+          +                                .setValueFormatter(ControlValueFormatterImpls.translateVariable("sodium.options.mobile_upload_budget.value"))
+          +                                .setTooltip(Component.translatable("sodium.options.mobile_upload_budget.tooltip"))
+          +                                .setRange(1, 5, 1)
+          +                                .setDefaultValue(DEFAULTS.performance.mobileUploadBudgetMs)
+          +                                .setBinding(value -> this.sodiumOpts.performance.mobileUploadBudgetMs = value, () -> this.sodiumOpts.performance.mobileUploadBudgetMs)
+          +                                .setImpact(OptionImpact.HIGH)
+          +                )
+          +                .addOption(
+          +                        builder.createBooleanOption(Identifier.parse("sodium:performance.mobile_adaptive_chunk_work"))
+          +                                .setStorageHandler(this.sodiumStorage)
+          +                                .setName(Component.translatable("sodium.options.mobile_adaptive_chunk_work.name"))
+          +                                .setTooltip(Component.translatable("sodium.options.mobile_adaptive_chunk_work.tooltip"))
+          +                                .setDefaultValue(DEFAULTS.performance.mobileAdaptiveChunkWork)
+          +                                .setBinding(value -> this.sodiumOpts.performance.mobileAdaptiveChunkWork = value, () -> this.sodiumOpts.performance.mobileAdaptiveChunkWork)
+          +                                .setImpact(OptionImpact.HIGH)
+          +                )
+          +                .addOption(
+          +                        builder.createBooleanOption(Identifier.parse("sodium:performance.mobile_fast_texture_sampling"))
+          +                                .setStorageHandler(this.sodiumStorage)
+          +                                .setName(Component.translatable("sodium.options.mobile_fast_texture_sampling.name"))
+          +                                .setTooltip(Component.translatable("sodium.options.mobile_fast_texture_sampling.tooltip"))
+          +                                .setDefaultValue(DEFAULTS.performance.mobileFastTextureSampling)
+          +                                .setBinding(value -> this.sodiumOpts.performance.mobileFastTextureSampling = value, () -> this.sodiumOpts.performance.mobileFastTextureSampling)
+          +                                .setImpact(OptionImpact.MEDIUM)
+          +                )
+          +        );
+          +
+          +        performancePage.addOptionGroup(builder.createOptionGroup()
+          +                .addOption(
+                                   builder.createEnumOption(Identifier.parse("sodium:performance.quad_splitting"), QuadSplittingMode.class)
+                                           .setStorageHandler(this.sodiumStorage)
+                                           .setName(Component.translatable("sodium.options.quad_splitting.name"))
+          diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumOptions.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumOptions.java
+          --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumOptions.java	2026-09-30 09:51:54.810254796 +0000
+          +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/gui/SodiumOptions.java	2026-09-30 09:51:54.907672070 +0000
+          @@ -54,6 +54,13 @@
+                   public boolean useNoErrorGLContext = true;
+
+                   public QuadSplittingMode quadSplittingMode = QuadSplittingMode.SAFE;
+          +
+          +        // Sodium Mobile: minimum per-frame time budget (ms) for uploading chunk meshes to the GPU
+          +        public int mobileUploadBudgetMs = 2;
+          +        // Sodium Mobile: temporarily reduce chunk work after frame-time spikes
+          +        public boolean mobileAdaptiveChunkWork = true;
+          +        // Sodium Mobile: cheaper terrain texture sampling (slightly different look at a distance)
+          +        public boolean mobileFastTextureSampling = false;
+               }
+
+               public static class AdvancedSettings {
+          diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/RenderSectionManager.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/RenderSectionManager.java
+          --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/RenderSectionManager.java	2026-09-30 09:51:54.812612870 +0000
+          +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/RenderSectionManager.java	2026-09-30 09:51:54.917836444 +0000
+          @@ -67,7 +67,14 @@
+               private static final float NEARBY_SORT_DISTANCE = Mth.square(25.0f);
+
+               private static final float FRAME_DURATION_UPLOAD_FRACTION = 0.1f;
+          -    private static final long MIN_UPLOAD_DURATION_BUDGET = 2_000_000L; // 2ms
+          +
+          +    // Sodium Mobile: adaptive chunk work. A frame longer than SPIKE_RATIO times the running average lowers
+          +    // mobileWorkFactor (scales the chunk build and upload budgets); it then recovers slowly so the budget
+          +    // does not oscillate. Helps weak mobile CPUs where one slow frame would otherwise be followed by more of the same.
+          +    private static final float MOBILE_SPIKE_RATIO = 1.6f;
+          +    private static final float MOBILE_SPIKE_DECAY = 0.8f;
+          +    private static final float MOBILE_RECOVERY_PER_FRAME = 0.01f;
+          +    private static final float MOBILE_MIN_WORK_FACTOR = 0.3f;
+
+               private final ChunkBuilder builder;
+
+          @@ -109,6 +116,7 @@
+               private int frame;
+               private long lastFrameDuration = -1;
+               private long averageFrameDuration = -1;
+          +    private float mobileWorkFactor = 1.0f;
+               private long lastFrameAtTime = System.nanoTime();
+               private static final float FRAME_DURATION_UPDATE_RATIO = 0.05f;
+
+          @@ -162,6 +170,16 @@
+                   }
+                   this.averageFrameDuration = Mth.clamp(this.averageFrameDuration, 1_000_100, 100_000_000);
+
+          +        if (SodiumClientMod.options().performance.mobileAdaptiveChunkWork) {
+          +            if (this.lastFrameDuration > this.averageFrameDuration * MOBILE_SPIKE_RATIO) {
+          +                this.mobileWorkFactor = Math.max(MOBILE_MIN_WORK_FACTOR, this.mobileWorkFactor * MOBILE_SPIKE_DECAY);
+          +            } else {
+          +                this.mobileWorkFactor = Math.min(1.0f, this.mobileWorkFactor + MOBILE_RECOVERY_PER_FRAME);
+          +            }
+          +        } else {
+          +            this.mobileWorkFactor = 1.0f;
+          +        }
+          +
+                   this.frame += 1;
+
+                   this.cameraPosition = cameraPosition;
+          @@ -564,12 +582,13 @@
+                       this.thisFrameBlockingTasks = thisFrameBlockingCollector.getSubmittedTaskCount();
+                       thisFrameBlockingCollector.awaitCompletion(this.builder);
+                   } else {
+          -            var remainingDuration = this.builder.getTotalRemainingDuration(this.averageFrameDuration);
+          +            var remainingDuration = (long) (this.builder.getTotalRemainingDuration(this.averageFrameDuration) * this.mobileWorkFactor);
+
+                       // an estimator is used estimate task duration and limit the execution time to the available worker capacity.
+                       // separately, tasks are limited by their estimated upload size and duration.
+                       var uploadBudget = new LimitedResourceBudget(
+          -                    Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION), MIN_UPLOAD_DURATION_BUDGET),
+          +                    Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION * this.mobileWorkFactor),
+          +                            (long) (SodiumClientMod.options().performance.mobileUploadBudgetMs * 1_000_000L * this.mobileWorkFactor)),
+                               this.regions.getStagingBuffer().getUploadSizeLimit(this.averageFrameDuration));
+
+                       var nextFrameBlockingCollector = new ChunkJobCollector(this.buildResults::add);
+          diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java
+          --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.814996702 +0000
+          +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.919331656 +0000
+          @@ -7,6 +7,7 @@
+           import com.mojang.blaze3d.textures.FilterMode;
+           import com.mojang.blaze3d.textures.GpuSampler;
+           import com.mojang.blaze3d.textures.GpuTextureView;
+          +import net.caffeinemc.mods.sodium.client.SodiumClientMod;
+           import net.caffeinemc.mods.sodium.client.gl.buffer.GlBuffer;
+           import net.caffeinemc.mods.sodium.client.gl.device.GLRenderDevice;
+           import net.caffeinemc.mods.sodium.client.gl.shader.uniform.*;
+          @@ -36,6 +37,7 @@
+               private final GlUniformFloat2v uniformTexCoordShrink;
+               private final GlUniformFloat2v uniformTexelSize;
+               private final GlUniformBool uniformRGSS;
+          +    private final GlUniformBool uniformFastSampling;
+               private final GlUniformInt uniformCurrentTime;
+               private final GlUniformFloat uniformFadePeriod;
+
+          @@ -51,6 +53,7 @@
+                   this.uniformTexCoordShrink = context.bindUniform("u_TexCoordShrink", GlUniformFloat2v::new);
+                   this.uniformTexelSize = context.bindUniform("u_TexelSize", GlUniformFloat2v::new);
+                   this.uniformRGSS = context.bindUniform("u_UseRGSS", GlUniformBool::new);
+          +        this.uniformFastSampling = context.bindUniform("u_FastSampling", GlUniformBool::new);
+
+                   this.uniformCurrentTime = context.bindUniform("u_CurrentTime", GlUniformInt::new);
+                   this.uniformFadePeriod = context.bindUniform("u_FadePeriodInv", GlUniformFloat::new);
+          @@ -92,6 +95,7 @@
+                   this.uniformFadePeriod.setFloat((float) (1.0 / (Minecraft.getInstance().options.chunkSectionFadeInTime().get() * 1000.0))); // this is in seconds!
+
+                   this.uniformRGSS.setBool(Minecraft.getInstance().options.textureFiltering().get() == TextureFilteringMethod.RGSS);
+          +        this.uniformFastSampling.setBool(SodiumClientMod.options().performance.mobileFastTextureSampling);
+
+                   this.fogShader.setup(parameters);
+               }
+          diff -ruN a/common/src/main/resources/assets/sodium/lang/en_us.json b/common/src/main/resources/assets/sodium/lang/en_us.json
+          --- a/common/src/main/resources/assets/sodium/lang/en_us.json	2026-09-30 09:51:54.826113872 +0000
+          +++ b/common/src/main/resources/assets/sodium/lang/en_us.json	2026-09-30 09:51:54.920172052 +0000
+          @@ -46,6 +46,13 @@
+             "sodium.options.use_entity_culling.tooltip": "If enabled, entities which are within the camera viewport, but not inside of a visible chunk, will be skipped during rendering. This optimization uses the visibility data which already exists for chunk rendering and does not add overhead.",
+             "sodium.options.animate_only_visible_textures.name": "Animate Only Visible Textures",
+             "sodium.options.animate_only_visible_textures.tooltip": "If enabled, only the animated textures which are determined to be visible in the current image will be updated. This can provide a significant performance improvement on some hardware, especially with heavier resource packs. If you experience issues with some textures not being animated, try disabling this option.",
+          +  "sodium.options.mobile_upload_budget.name": "Mobile: Chunk Upload Budget",
+          +  "sodium.options.mobile_upload_budget.tooltip": "Minimum time per frame spent sending new chunk meshes to the GPU. Lower values reduce stutter while moving, but new chunks appear a little later.",
+          +  "sodium.options.mobile_upload_budget.value": "%s ms",
+          +  "sodium.options.mobile_adaptive_chunk_work.name": "Mobile: Adaptive Chunk Work",
+          +  "sodium.options.mobile_adaptive_chunk_work.tooltip": "Temporarily reduces background chunk building and uploading after a slow frame, then restores it gradually. Helps keep frame times steady on weak devices.",
+          +  "sodium.options.mobile_fast_texture_sampling.name": "Mobile: Fast Texture Sampling",
+          +  "sodium.options.mobile_fast_texture_sampling.tooltip": "Uses a single plain texture lookup per pixel for terrain instead of Sodium's sharpened sampling. Cheaper on the GPU, but distant blocks look slightly different.",
+             "sodium.options.cpu_render_ahead_limit.name": "CPU Render-Ahead Limit",
+             "sodium.options.cpu_render_ahead_limit.tooltip": "For debugging only. Specifies the maximum number of frames which can be in-flight to the GPU. Changing this value is not recommended, as very low or high values may create frame rate instability.",
+             "sodium.options.cpu_render_ahead_limit.value": "%s frame(s)",
+          diff -ruN a/common/src/main/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh b/common/src/main/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh
+          --- a/common/src/main/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh	2026-09-30 09:51:54.826196839 +0000
+          +++ b/common/src/main/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh	2026-09-30 09:51:54.919743402 +0000
+          @@ -17,6 +17,8 @@
+           uniform vec2 u_RenderFog; // The start and end position for border fog
+           uniform vec2 u_TexelSize;
+           uniform bool u_UseRGSS;
+          +// Sodium Mobile: skip the derivative-based sharpening and use one plain texture lookup per pixel
+          +uniform bool u_FastSampling;
+
+           out vec4 fragColor; // The output fragment for the color framebuffer
+
+          @@ -84,7 +86,8 @@
+           }
+
+           void main() {
+          -    vec4 color = u_UseRGSS ? sampleRGSS(u_BlockTex, v_TexCoord, u_TexelSize) : sampleNearest(u_BlockTex, v_TexCoord, u_TexelSize);
+          +    vec4 color = u_FastSampling ? texture(u_BlockTex, v_TexCoord)
+          +            : (u_UseRGSS ? sampleRGSS(u_BlockTex, v_TexCoord, u_TexelSize) : sampleNearest(u_BlockTex, v_TexCoord, u_TexelSize));
+               color *= v_Color; // Apply per-vertex color modulator
+
+           #ifdef USE_FRAGMENT_DISCARD
+          PATCH_EOF
+          cd sodium-mc1.21.11-0.8.14
+          git apply -p1 --whitespace=nowarn ../mobile.patch
+      - name: Build Fabric jar
+        run: |
+          cd sodium-mc1.21.11-0.8.14
+          chmod +x gradlew
+          ./gradlew :fabric:build -Pbuild.release
+      - name: Collect jar
+        run: |
+          mkdir out
+          JAR=$(ls sodium-mc1.21.11-0.8.14/fabric/build/libs/*.jar | grep -v -e sources -e dev -e javadoc | head -1)
+          cp "$JAR" out/sodium-mobile-1.0-mc1.21.11.jar
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sodium-Mobile-1.0
+          path: out/*.jar
