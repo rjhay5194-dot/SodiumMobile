@@ -1,5 +1,6 @@
 name: Build Sodium Mobile
 # One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
+# v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
 on:
   workflow_dispatch:
   push:
@@ -122,21 +123,21 @@ jobs:
 
                    this.cameraPosition = cameraPosition;
           @@ -564,12 +582,13 @@
-                       this.thisFrameBlockingTasks = thisFrameBlockingCollector.getSubmittedTaskCount();
-                       thisFrameBlockingCollector.awaitCompletion(this.builder);
-                   } else {
-          -            var remainingDuration = this.builder.getTotalRemainingDuration(this.averageFrameDuration);
-          +            var remainingDuration = (long) (this.builder.getTotalRemainingDuration(this.averageFrameDuration) * this.mobileWorkFactor);
+                           this.thisFrameBlockingTasks = thisFrameBlockingCollector.getSubmittedTaskCount();
+                           thisFrameBlockingCollector.awaitCompletion(this.builder);
+                       } else {
+          -                var remainingDuration = this.builder.getTotalRemainingDuration(this.averageFrameDuration);
+          +                var remainingDuration = (long) (this.builder.getTotalRemainingDuration(this.averageFrameDuration) * this.mobileWorkFactor);
 
-                       // an estimator is used estimate task duration and limit the execution time to the available worker capacity.
-                       // separately, tasks are limited by their estimated upload size and duration.
-                       var uploadBudget = new LimitedResourceBudget(
-          -                    Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION), MIN_UPLOAD_DURATION_BUDGET),
-          +                    Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION * this.mobileWorkFactor),
-          +                            (long) (SodiumClientMod.options().performance.mobileUploadBudgetMs * 1_000_000L * this.mobileWorkFactor)),
-                               this.regions.getStagingBuffer().getUploadSizeLimit(this.averageFrameDuration));
+                           // an estimator is used estimate task duration and limit the execution time to the available worker capacity.
+                           // separately, tasks are limited by their estimated upload size and duration.
+                           var uploadBudget = new LimitedResourceBudget(
+          -                        Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION), MIN_UPLOAD_DURATION_BUDGET),
+          +                        Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION * this.mobileWorkFactor),
+          +                                (long) (SodiumClientMod.options().performance.mobileUploadBudgetMs * 1_000_000L * this.mobileWorkFactor)),
+                                   this.regions.getStagingBuffer().getUploadSizeLimit(this.averageFrameDuration));
 
-                       var nextFrameBlockingCollector = new ChunkJobCollector(this.buildResults::add);
+                           var nextFrameBlockingCollector = new ChunkJobCollector(this.buildResults::add);
           diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java
           --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.814996702 +0000
           +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.919331656 +0000
@@ -214,6 +215,223 @@ jobs:
           PATCH_EOF
           cd sodium-mc1.21.11-0.8.14
           git apply -p1 --whitespace=nowarn ../mobile.patch
+      - name: Apply far chunk culling and far texture detail
+        run: |
+          cd sodium-mc1.21.11-0.8.14
+          python3 - <<'PY_EOF'
+          import re, sys, os
+
+          BASE = "common/src/main"
+          JAVA = BASE + "/java/net/caffeinemc/mods/sodium/client/"
+          P_OPTS = JAVA + "gui/SodiumOptions.java"
+          P_CFG = JAVA + "gui/SodiumConfigBuilder.java"
+          P_RSM = JAVA + "render/chunk/RenderSectionManager.java"
+          P_DSI = JAVA + "render/chunk/shader/DefaultShaderInterface.java"
+          P_LANG = BASE + "/resources/assets/sodium/lang/en_us.json"
+          P_FSH = BASE + "/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh"
+
+          applied = []
+
+
+          def rd(p):
+              with open(p, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def wr(p, s):
+              with open(p, "w", encoding="utf-8", newline="") as f:
+                  f.write(s)
+
+
+          class Skip(Exception):
+              pass
+
+
+          def need(cond, msg):
+              if not cond:
+                  raise Skip(msg)
+
+
+          def insert_after(s, anchor, text, what):
+              need(s.count(anchor) == 1, what + ": anchor not found exactly once")
+              i = s.index(anchor) + len(anchor)
+              return s[:i] + text + s[i:]
+
+
+          def option_block(ident, name, formatter, tip, lo, hi, step, field, impact):
+              return (
+                  "\n                .addOption(\n"
+                  "                        builder.createIntegerOption(Identifier.parse(\"sodium:performance.%s\"))\n"
+                  "                                .setStorageHandler(this.sodiumStorage)\n"
+                  "                                .setName(Component.translatable(\"sodium.options.%s.name\"))\n"
+                  "                                .setValueFormatter(ControlValueFormatterImpls.translateVariable(\"sodium.options.%s.value\"))\n"
+                  "                                .setTooltip(Component.translatable(\"sodium.options.%s.tooltip\"))\n"
+                  "                                .setRange(%d, %d, %d)\n"
+                  "                                .setDefaultValue(DEFAULTS.performance.%s)\n"
+                  "                                .setBinding(value -> this.sodiumOpts.performance.%s = value, () -> this.sodiumOpts.performance.%s)\n"
+                  "                                .setImpact(OptionImpact.%s)\n"
+                  "                )"
+              ) % (ident, ident, ident, ident, lo, hi, step, field, field, field, impact)
+
+
+          def lang_lines(items):
+              out = ""
+              for k, v in items:
+                  out += '  "%s": "%s",\n' % (k, v)
+              return out
+
+
+          def add_options(s_opts, s_cfg, s_lang, fields, blocks, lang):
+              s_opts = insert_after(
+                  s_opts,
+                  "public boolean mobileFastTextureSampling = false;\n",
+                  fields,
+                  "SodiumOptions",
+              )
+              marker = "sodium:performance.mobile_fast_texture_sampling"
+              need(s_cfg.count(marker) == 1, "SodiumConfigBuilder: marker not found")
+              start = s_cfg.index(marker)
+              end = s_cfg.find("\n        );", start)
+              need(end > 0, "SodiumConfigBuilder: end of option group not found")
+              s_cfg = s_cfg[:end] + blocks + s_cfg[end:]
+              m = re.search(r'^[ \t]*"sodium\.options\.mobile_fast_texture_sampling\.tooltip".*\n', s_lang, re.M)
+              need(m is not None, "en_us.json: anchor not found")
+              s_lang = s_lang[: m.end()] + lang + s_lang[m.end():]
+              return s_opts, s_cfg, s_lang
+
+
+          # ---------------------------------------------------------------- culling
+          def feature_cull():
+              s_opts, s_cfg, s_lang, s_rsm = rd(P_OPTS), rd(P_CFG), rd(P_LANG), rd(P_RSM)
+
+              fields = (
+                  "        // Sodium Mobile: stop drawing terrain beyond this % of the render distance (100 = off)\n"
+                  "        public int mobileFarCullPercent = 100;\n"
+              )
+              blocks = option_block(
+                  "mobile_far_cull", "", "", "", 50, 100, 5, "mobileFarCullPercent", "HIGH"
+              )
+              lang = lang_lines([
+                  ("sodium.options.mobile_far_cull.name", "Mobile: Far Chunk Culling"),
+                  ("sodium.options.mobile_far_cull.tooltip",
+                   "Stops drawing (and building) terrain beyond this percentage of your render distance. Lower values give more FPS, but if you go below the fog distance a visible edge can appear. 100% is off."),
+                  ("sodium.options.mobile_far_cull.value", "%s%%"),
+              ])
+              s_opts, s_cfg, s_lang = add_options(s_opts, s_cfg, s_lang, fields, blocks, lang)
+
+              # scale the visibility search distance
+              pat = re.compile(r"((?:final\s+)?(?:var|float)\s+searchDistance\s*=\s*)([^;]+);")
+              ms = pat.findall(s_rsm)
+              need(len(ms) == 1, "RenderSectionManager: searchDistance assignment found %d times" % len(ms))
+              s_rsm = pat.sub(lambda m: m.group(1) + "mobileCullDistance(" + m.group(2) + ");", s_rsm, count=1)
+              need("SodiumClientMod" in s_rsm, "RenderSectionManager: SodiumClientMod not available")
+              last = s_rsm.rstrip().rfind("}")
+              need(last > 0, "RenderSectionManager: class end not found")
+              method = (
+                  "\n    // Sodium Mobile: far chunk culling. Shrinks the visibility search distance to a percentage of the\n"
+                  "    // render distance. Never goes below 64 blocks, and 100% leaves vanilla behaviour untouched.\n"
+                  "    private static float mobileCullDistance(float distance) {\n"
+                  "        int percent = SodiumClientMod.options().performance.mobileFarCullPercent;\n"
+                  "        if (percent >= 100) {\n"
+                  "            return distance;\n"
+                  "        }\n"
+                  "        return Math.min(distance, Math.max(distance * (percent / 100.0f), 64.0f));\n"
+                  "    }\n"
+              )
+              s_rsm = s_rsm[:last] + method + s_rsm[last:]
+              wr(P_OPTS, s_opts); wr(P_CFG, s_cfg); wr(P_LANG, s_lang); wr(P_RSM, s_rsm)
+
+
+          # ---------------------------------------------------------------- far texture lod
+          def feature_lod():
+              s_opts, s_cfg, s_lang, s_dsi, s_fsh = rd(P_OPTS), rd(P_CFG), rd(P_LANG), rd(P_DSI), rd(P_FSH)
+
+              fields = (
+                  "        // Sodium Mobile: extra mip levels for distant terrain (0 = off, 1 = 8x8, 2 = 4x4) and where they start\n"
+                  "        public int mobileFarLodLevel = 0;\n"
+                  "        public int mobileFarLodStartChunks = 8;\n"
+              )
+              blocks = (
+                  option_block("mobile_far_lod_level", "", "", "", 0, 2, 1, "mobileFarLodLevel", "MEDIUM")
+                  + option_block("mobile_far_lod_start", "", "", "", 2, 32, 1, "mobileFarLodStartChunks", "MEDIUM")
+              )
+              lang = lang_lines([
+                  ("sodium.options.mobile_far_lod_level.name", "Mobile: Far Texture Detail"),
+                  ("sodium.options.mobile_far_lod_level.tooltip",
+                   "Distant terrain uses smaller versions of block textures (level 1 = 8x8, level 2 = 4x4), which is cheaper for the GPU. Needs Mipmap Levels of 2 or higher in Video Settings. 0 is off."),
+                  ("sodium.options.mobile_far_lod_level.value", "Level %s"),
+                  ("sodium.options.mobile_far_lod_start.name", "Mobile: Far Texture Start"),
+                  ("sodium.options.mobile_far_lod_start.tooltip",
+                   "How many chunks away from you the smaller textures begin to blend in."),
+                  ("sodium.options.mobile_far_lod_start.value", "%s chunks"),
+              ])
+              s_opts, s_cfg, s_lang = add_options(s_opts, s_cfg, s_lang, fields, blocks, lang)
+
+              # java: uniform
+              s_dsi = insert_after(
+                  s_dsi, "    private final GlUniformBool uniformFastSampling;\n",
+                  "    private final GlUniformFloat2v uniformFarLod;\n", "DefaultShaderInterface field")
+              s_dsi = insert_after(
+                  s_dsi, '        this.uniformFastSampling = context.bindUniform("u_FastSampling", GlUniformBool::new);\n',
+                  '        this.uniformFarLod = context.bindUniform("u_FarLod", GlUniformFloat2v::new);\n',
+                  "DefaultShaderInterface bind")
+              s_dsi = insert_after(
+                  s_dsi,
+                  "        this.uniformFastSampling.setBool(SodiumClientMod.options().performance.mobileFastTextureSampling);\n",
+                  "        this.uniformFarLod.set(new float[] {\n"
+                  "                SodiumClientMod.options().performance.mobileFarLodStartChunks * 16.0f,\n"
+                  "                (float) SodiumClientMod.options().performance.mobileFarLodLevel\n"
+                  "        });\n",
+                  "DefaultShaderInterface set")
+
+              # shader
+              need("v_FragDistance" in s_fsh, "fsh: v_FragDistance missing")
+              need(s_fsh.count("uniform bool u_FastSampling;\n") == 1, "fsh: u_FastSampling anchor")
+              need(s_fsh.count("texture(u_BlockTex, v_TexCoord)") == 1, "fsh: fast sampling call")
+              need(s_fsh.count("void main() {\n") == 1, "fsh: main anchor")
+              nx, ny = s_fsh.count("dFdx(uv)"), s_fsh.count("dFdy(uv)")
+              need(nx >= 1 and ny >= 1, "fsh: derivative anchors")
+
+              s_fsh = s_fsh.replace("dFdx(uv)", "(dFdx(uv) * g_LodScale)").replace("dFdy(uv)", "(dFdy(uv) * g_LodScale)")
+              s_fsh = s_fsh.replace("texture(u_BlockTex, v_TexCoord)", "texture(u_BlockTex, v_TexCoord, g_LodBias)")
+              s_fsh = s_fsh.replace(
+                  "uniform bool u_FastSampling;\n",
+                  "uniform bool u_FastSampling;\n"
+                  "// Sodium Mobile: distant terrain uses smaller mip levels. x = start distance (blocks), y = extra mip levels (0 = off)\n"
+                  "uniform vec2 u_FarLod;\n"
+                  "float g_LodBias = 0.0;\n"
+                  "float g_LodScale = 1.0;\n", 1)
+              s_fsh = s_fsh.replace(
+                  "void main() {\n",
+                  "void main() {\n"
+                  "    if (u_FarLod.y > 0.0) {\n"
+                  "        float farLevels = u_FarLod.y;\n"
+                  "        float farDistance = 0.0;\n"
+                  "#ifdef USE_FOG\n"
+                  "        farDistance = v_FragDistance.x;\n"
+                  "#endif\n"
+                  "#ifdef USE_FRAGMENT_DISCARD\n"
+                  "        farLevels = min(farLevels, 1.0); // keep cutout edges (leaves, glass) readable\n"
+                  "#endif\n"
+                  "        g_LodBias = clamp((farDistance - u_FarLod.x) * (1.0 / 32.0), 0.0, 1.0) * farLevels;\n"
+                  "        g_LodScale = exp2(g_LodBias);\n"
+                  "    }\n", 1)
+              wr(P_OPTS, s_opts); wr(P_CFG, s_cfg); wr(P_LANG, s_lang); wr(P_DSI, s_dsi); wr(P_FSH, s_fsh)
+
+
+          for name, fn in (("cull", feature_cull), ("lod", feature_lod)):
+              try:
+                  fn()
+                  applied.append(name)
+                  print("APPLIED:", name)
+              except Skip as e:
+                  print("::warning::Sodium Mobile feature '%s' SKIPPED: %s" % (name, e))
+                  print("SKIPPED:", name, "-", e)
+
+          with open("../applied.txt", "w") as f:
+              f.write("-".join(applied))
+          PY_EOF
+          echo "Features applied: $(cat ../applied.txt)"
       - name: Build Fabric jar
         run: |
           cd sodium-mc1.21.11-0.8.14
@@ -223,9 +441,10 @@ jobs:
         run: |
           mkdir out
           JAR=$(ls sodium-mc1.21.11-0.8.14/build/mods/*.jar | head -1)
-          cp "$JAR" out/sodium-mobile-1.0-mc1.21.11.jar
+          TAG=$(cat applied.txt)
+          cp "$JAR" "out/sodium-mobile-1.1-${TAG}-mc1.21.11.jar"
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: Sodium-Mobile-1.0
+          name: Sodium-Mobile-1.1
           path: out/*.jar
