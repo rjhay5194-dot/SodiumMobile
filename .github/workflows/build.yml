@@ -1,6 +1,6 @@
 name: Build Sodium Mobile
 # One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
-# v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
+# v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
 on:
   workflow_dispatch:
   push:
@@ -122,22 +122,6 @@ jobs:
                    this.frame += 1;
 
                    this.cameraPosition = cameraPosition;
-          @@ -564,12 +582,13 @@
-                           this.thisFrameBlockingTasks = thisFrameBlockingCollector.getSubmittedTaskCount();
-                           thisFrameBlockingCollector.awaitCompletion(this.builder);
-                       } else {
-          -                var remainingDuration = this.builder.getTotalRemainingDuration(this.averageFrameDuration);
-          +                var remainingDuration = (long) (this.builder.getTotalRemainingDuration(this.averageFrameDuration) * this.mobileWorkFactor);
-
-                           // an estimator is used estimate task duration and limit the execution time to the available worker capacity.
-                           // separately, tasks are limited by their estimated upload size and duration.
-                           var uploadBudget = new LimitedResourceBudget(
-          -                        Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION), MIN_UPLOAD_DURATION_BUDGET),
-          +                        Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION * this.mobileWorkFactor),
-          +                                (long) (SodiumClientMod.options().performance.mobileUploadBudgetMs * 1_000_000L * this.mobileWorkFactor)),
-                                   this.regions.getStagingBuffer().getUploadSizeLimit(this.averageFrameDuration));
-
-                           var nextFrameBlockingCollector = new ChunkJobCollector(this.buildResults::add);
           diff -ruN a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java
           --- a/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.814996702 +0000
           +++ b/common/src/main/java/net/caffeinemc/mods/sodium/client/render/chunk/shader/DefaultShaderInterface.java	2026-09-30 09:51:54.919331656 +0000
@@ -419,7 +403,29 @@ jobs:
               wr(P_OPTS, s_opts); wr(P_CFG, s_cfg); wr(P_LANG, s_lang); wr(P_DSI, s_dsi); wr(P_FSH, s_fsh)
 
 
-          for name, fn in (("cull", feature_cull), ("lod", feature_lod)):
+          # ---------------------------------------------------------------- core: work factor applied to build/upload budgets
+          def feature_core():
+              s_rsm = rd(P_RSM)
+              pat_rem = re.compile(r"(\w+)(\s+remainingDuration\s*=\s*)(this\.builder\.getTotalRemainingDuration\(this\.averageFrameDuration\))\s*;")
+              pat_up = re.compile(r"Math\.max\(\s*\(long\)\s*\(\s*this\.averageFrameDuration\s*\*\s*FRAME_DURATION_UPLOAD_FRACTION\s*\)\s*,\s*MIN_UPLOAD_DURATION_BUDGET\s*\)")
+              if len(pat_rem.findall(s_rsm)) != 1 or len(pat_up.findall(s_rsm)) != 1:
+                  # keep the build compiling: hunk 1 of the patch removed this constant
+                  if "MIN_UPLOAD_DURATION_BUDGET =" not in s_rsm:
+                      s_rsm = insert_after(
+                          s_rsm, "private static final float MOBILE_MIN_WORK_FACTOR = 0.3f;\n",
+                          "    private static final long MIN_UPLOAD_DURATION_BUDGET = 2_000_000L;\n", "RSM constant fallback")
+                      wr(P_RSM, s_rsm)
+                  need(False, "RenderSectionManager: build/upload budget lines not found (slider + adaptive work will have no effect)")
+              s_rsm = pat_rem.sub(
+                  lambda m: "long" + m.group(2) + "(long) (" + m.group(3) + " * this.mobileWorkFactor);", s_rsm, count=1)
+              s_rsm = pat_up.sub(
+                  "Math.max((long) (this.averageFrameDuration * FRAME_DURATION_UPLOAD_FRACTION * this.mobileWorkFactor),\n"
+                  "                                (long) (SodiumClientMod.options().performance.mobileUploadBudgetMs * 1_000_000L * this.mobileWorkFactor))",
+                  s_rsm, count=1)
+              wr(P_RSM, s_rsm)
+
+
+          for name, fn in (("core", feature_core), ("cull", feature_cull), ("lod", feature_lod)):
               try:
                   fn()
                   applied.append(name)
