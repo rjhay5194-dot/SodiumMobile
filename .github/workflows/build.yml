@@ -1,6 +1,6 @@
 name: Build Sodium Mobile
 # One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
-# v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
+# v1.2: Mobile settings tab, Flat Lighting, Simplified Far Terrain, Hide Underground (auto fallback to v1.1 if one fails to build). v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
 on:
   workflow_dispatch:
   push:
@@ -438,19 +438,371 @@ jobs:
               f.write("-".join(applied))
           PY_EOF
           echo "Features applied: $(cat ../applied.txt)"
-      - name: Build Fabric jar
+      - name: Build Fabric jar (v1.2 features, falls back to v1.1 if one fails)
         run: |
-          cd sodium-mc1.21.11-0.8.14
-          chmod +x gradlew
-          ./gradlew :fabric:build -Pbuild.release
+          cat > v12.py <<'PY_EOF'
+          import re, sys, os
+
+          BASE = "common/src/main"
+          JAVA = BASE + "/java/net/caffeinemc/mods/sodium/client/"
+          P_OPTS = JAVA + "gui/SodiumOptions.java"
+          P_CFG = JAVA + "gui/SodiumConfigBuilder.java"
+          P_LANG = BASE + "/resources/assets/sodium/lang/en_us.json"
+          P_OCC = JAVA + "render/chunk/occlusion/OcclusionCuller.java"
+          P_DCR = JAVA + "render/chunk/DefaultChunkRenderer.java"
+          P_ABRC = JAVA + "render/model/AbstractBlockRenderContext.java"
+          P_FLUID = JAVA + "render/chunk/compile/pipeline/DefaultFluidRenderer.java"
+          P_TWEAKS = JAVA + "render/chunk/MobileTweaks.java"
+
+          SKIP = [x.strip() for x in os.environ.get("MOBILE_V12_SKIP", "").split(",") if x.strip()]
+          applied = []
+
+
+          def rd(p):
+              with open(p, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def wr(p, s):
+              with open(p, "w", encoding="utf-8", newline="") as f:
+                  f.write(s)
+
+
+          class Skip(Exception):
+              pass
+
+
+          def need(cond, msg):
+              if not cond:
+                  raise Skip(msg)
+
+
+          def insert_after(s, anchor, text, what):
+              need(s.count(anchor) == 1, what + ": anchor not found exactly once")
+              i = s.index(anchor) + len(anchor)
+              return s[:i] + text + s[i:]
+
+
+          def replace_once(s, old, new, what):
+              need(s.count(old) == 1, what + ": anchor not found exactly once")
+              return s.replace(old, new, 1)
+
+
+          def opt_block(kind, ident, lo, hi, step, field, impact, reload_flag=False):
+              head = "\n                .addOption(\n"
+              if kind == "bool":
+                  head += '                        builder.createBooleanOption(Identifier.parse("sodium:performance.%s"))\n' % ident
+              else:
+                  head += '                        builder.createIntegerOption(Identifier.parse("sodium:performance.%s"))\n' % ident
+              head += "                                .setStorageHandler(this.sodiumStorage)\n"
+              head += '                                .setName(Component.translatable("sodium.options.%s.name"))\n' % ident
+              if kind == "int":
+                  head += '                                .setValueFormatter(ControlValueFormatterImpls.translateVariable("sodium.options.%s.value"))\n' % ident
+              head += '                                .setTooltip(Component.translatable("sodium.options.%s.tooltip"))\n' % ident
+              if kind == "int":
+                  head += "                                .setRange(%d, %d, %d)\n" % (lo, hi, step)
+              head += "                                .setDefaultValue(DEFAULTS.performance.%s)\n" % field
+              head += "                                .setBinding(value -> this.sodiumOpts.performance.%s = value, () -> this.sodiumOpts.performance.%s)\n" % (field, field)
+              head += "                                .setImpact(OptionImpact.%s)\n" % impact
+              if reload_flag:
+                  head += "                                .setFlags(OptionFlag.REQUIRES_RENDERER_RELOAD)\n"
+              head += "                )"
+              return head
+
+
+          def lang_lines(items):
+              out = ""
+              for k, v in items:
+                  out += '  "%s": "%s",\n' % (k, v)
+              return out
+
+
+          def add_options(fields, blocks, lang):
+              s_opts, s_cfg, s_lang = rd(P_OPTS), rd(P_CFG), rd(P_LANG)
+              s_opts = insert_after(s_opts, "public boolean mobileFastTextureSampling = false;\n", fields, "SodiumOptions")
+              marker = "sodium:performance.mobile_fast_texture_sampling"
+              need(s_cfg.count(marker) == 1, "SodiumConfigBuilder: marker not found")
+              start = s_cfg.index(marker)
+              end = s_cfg.find("\n        );", start)
+              need(end > 0, "SodiumConfigBuilder: end of option group not found")
+              s_cfg = s_cfg[:end] + blocks + s_cfg[end:]
+              m = re.search(r'^[ \t]*"sodium\.options\.mobile_fast_texture_sampling\.tooltip".*\n', s_lang, re.M)
+              need(m is not None, "en_us.json: anchor not found")
+              s_lang = s_lang[: m.end()] + lang + s_lang[m.end():]
+              wr(P_OPTS, s_opts); wr(P_CFG, s_cfg); wr(P_LANG, s_lang)
+
+
+          # ------------------------------------------------------------ flat lighting
+          def feature_flat():
+              s1 = rd(P_ABRC)
+              s2 = rd(P_FLUID)
+              s1 = replace_once(
+                  s1, "this.useAmbientOcclusion = Minecraft.useAmbientOcclusion();",
+                  "this.useAmbientOcclusion = Minecraft.useAmbientOcclusion() && !net.caffeinemc.mods.sodium.client.SodiumClientMod.options().performance.mobileFlatLighting;",
+                  "AbstractBlockRenderContext")
+              s2 = replace_once(
+                  s2, "isWater && Minecraft.useAmbientOcclusion() ?",
+                  "isWater && Minecraft.useAmbientOcclusion() && !net.caffeinemc.mods.sodium.client.SodiumClientMod.options().performance.mobileFlatLighting ?",
+                  "DefaultFluidRenderer")
+              fields = (
+                  "        // Sodium Mobile: flat lighting (no smooth lighting / ambient occlusion on terrain)\n"
+                  "        public boolean mobileFlatLighting = true;\n")
+              blocks = opt_block("bool", "mobile_flat_lighting", 0, 0, 0, "mobileFlatLighting", "HIGH", True)
+              lang = lang_lines([
+                  ("sodium.options.mobile_flat_lighting.name", "Mobile: Flat Lighting"),
+                  ("sodium.options.mobile_flat_lighting.tooltip",
+                   "Turns off smooth lighting and ambient occlusion on terrain, so chunks build faster and render with less work. Blocks look flatter."),
+              ])
+              add_options(fields, blocks, lang)
+              wr(P_ABRC, s1); wr(P_FLUID, s2)
+
+
+          # ------------------------------------------------------------ simplified far terrain
+          def feature_far():
+              s = rd(P_DCR)
+              need("slices &= SectionRenderDataUnsafe.getSliceMask(pMeshData);" in s, "DefaultChunkRenderer: slice mask anchor")
+              s = insert_after(
+                  s, "        int originZ = renderRegion.getChunkZ();\n",
+                  "\n"
+                  "        // Sodium Mobile: simplified far terrain. Beyond the start distance only top/bottom faces (mode 1)\n"
+                  "        // or only top faces (mode 2, opaque only) are drawn.\n"
+                  "        final var mobilePerf = net.caffeinemc.mods.sodium.client.SodiumClientMod.options().performance;\n"
+                  "        final int mobileFarMode = mobilePerf.mobileSimplifyFar;\n"
+                  "        final int mobileFarStart = mobilePerf.mobileSimplifyFarStartChunks;\n"
+                  "        final int mobileFarStartSq = mobileFarStart * mobileFarStart;\n"
+                  "        final int mobileCamChunkX = camera.intX >> 4;\n"
+                  "        final int mobileCamChunkZ = camera.intZ >> 4;\n"
+                  "        final int mobileFarKeep = (1 << ModelQuadFacing.UNASSIGNED.ordinal()) | (1 << ModelQuadFacing.POS_Y.ordinal()) | (1 << ModelQuadFacing.NEG_Y.ordinal());\n"
+                  "        final int mobileFarTop = (mobileFarMode >= 2 && !pass.isTranslucent()) ? (1 << ModelQuadFacing.POS_Y.ordinal()) : mobileFarKeep;\n",
+                  "DefaultChunkRenderer locals")
+              s = insert_after(
+                  s, "            slices &= SectionRenderDataUnsafe.getSliceMask(pMeshData);\n",
+                  "\n"
+                  "            if (mobileFarMode > 0) {\n"
+                  "                int mobileDx = chunkX - mobileCamChunkX;\n"
+                  "                int mobileDz = chunkZ - mobileCamChunkZ;\n"
+                  "                if (mobileDx * mobileDx + mobileDz * mobileDz > mobileFarStartSq) {\n"
+                  "                    slices &= mobileFarTop;\n"
+                  "                }\n"
+                  "            }\n",
+                  "DefaultChunkRenderer mask")
+              fields = (
+                  "        // Sodium Mobile: simplified far terrain (0 = off, 1 = no side faces, 2 = top faces only) and where it starts\n"
+                  "        public int mobileSimplifyFar = 1;\n"
+                  "        public int mobileSimplifyFarStartChunks = 6;\n")
+              blocks = (opt_block("int", "mobile_simplify_far", 0, 2, 1, "mobileSimplifyFar", "HIGH")
+                        + opt_block("int", "mobile_simplify_far_start", 2, 32, 1, "mobileSimplifyFarStartChunks", "MEDIUM"))
+              lang = lang_lines([
+                  ("sodium.options.mobile_simplify_far.name", "Mobile: Simplified Far Terrain"),
+                  ("sodium.options.mobile_simplify_far.tooltip",
+                   "Distant terrain skips most of its geometry. Level 1 drops the side faces of blocks, level 2 draws only top faces. Big FPS gain, but cliffs and hills far away get holes. 0 is off."),
+                  ("sodium.options.mobile_simplify_far.value", "Level %s"),
+                  ("sodium.options.mobile_simplify_far_start.name", "Mobile: Simplified Terrain Start"),
+                  ("sodium.options.mobile_simplify_far_start.tooltip",
+                   "How many chunks away from you the simplified terrain begins."),
+                  ("sodium.options.mobile_simplify_far_start.value", "%s chunks"),
+              ])
+              add_options(fields, blocks, lang)
+              wr(P_DCR, s)
+
+
+          # ------------------------------------------------------------ hide underground sections
+          TWEAKS_JAVA = '''package net.caffeinemc.mods.sodium.client.render.chunk;
+
+          import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+          import net.caffeinemc.mods.sodium.client.SodiumClientMod;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.levelgen.Heightmap;
+
+          /**
+           * Sodium Mobile: hides chunk sections that are far below the terrain surface while the camera is outside caves.
+           * Only used from the render thread.
+           */
+          public final class MobileTweaks {
+              private static final Long2IntOpenHashMap SURFACE = new Long2IntOpenHashMap();
+              private static final int UNKNOWN = Integer.MIN_VALUE;
+
+              static {
+                  SURFACE.defaultReturnValue(UNKNOWN);
+              }
+
+              private static Level level;
+              private static boolean active;
+              private static int depth;
+              private static int cameraY;
+              private static int frames;
+
+              private MobileTweaks() {
+              }
+
+              public static void beginFrame(Level currentLevel, int cameraX, int cameraYIn, int cameraZ) {
+                  var perf = SodiumClientMod.options().performance;
+
+                  if (!perf.mobileHideUnderground || currentLevel == null) {
+                      active = false;
+                      return;
+                  }
+
+                  if (currentLevel != level || (++frames % 120) == 0 || SURFACE.size() > 40000) {
+                      SURFACE.clear();
+                      level = currentLevel;
+                  }
+
+                  depth = perf.mobileUndergroundDepthChunks * 16;
+                  cameraY = cameraYIn;
+
+                  // only hide things while the camera is outside caves and buildings
+                  int cameraSurface = currentLevel.getHeight(Heightmap.Types.WORLD_SURFACE, cameraX, cameraZ);
+                  active = cameraYIn >= cameraSurface - 6;
+              }
+
+              public static boolean isHiddenUnderground(int chunkX, int chunkY, int chunkZ) {
+                  if (!active) {
+                      return false;
+                  }
+
+                  int sectionTop = (chunkY << 4) + 16;
+
+                  // never hide anything at or above the camera
+                  if (sectionTop >= cameraY - 16) {
+                      return false;
+                  }
+
+                  long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+                  int surface = SURFACE.get(key);
+
+                  if (surface == UNKNOWN) {
+                      surface = level.getHeight(Heightmap.Types.WORLD_SURFACE, (chunkX << 4) + 8, (chunkZ << 4) + 8);
+                      SURFACE.put(key, surface);
+                  }
+
+                  return sectionTop < surface - depth;
+              }
+          }
+          '''
+
+
+          def feature_underground():
+              s = rd(P_OCC)
+              s = replace_once(
+                  s,
+                  "        return isWithinRenderDistance(viewport.getTransform(), section, maxDistance) && isWithinFrustum(viewport, section);",
+                  "        return isWithinRenderDistance(viewport.getTransform(), section, maxDistance) && isWithinFrustum(viewport, section)\n"
+                  "                && !net.caffeinemc.mods.sodium.client.render.chunk.MobileTweaks.isHiddenUnderground(section.getChunkX(), section.getChunkY(), section.getChunkZ());",
+                  "OcclusionCuller visible check")
+              s = replace_once(
+                  s,
+                  "        final var queues = this.queue;\n        queues.reset();\n",
+                  "        final var queues = this.queue;\n        queues.reset();\n\n"
+                  "        {\n"
+                  "            var mobileCamera = viewport.getTransform();\n"
+                  "            net.caffeinemc.mods.sodium.client.render.chunk.MobileTweaks.beginFrame(this.level, mobileCamera.intX, mobileCamera.intY, mobileCamera.intZ);\n"
+                  "        }\n",
+                  "OcclusionCuller findVisible")
+              fields = (
+                  "        // Sodium Mobile: hide chunk sections deeper than this many chunks below the surface (while outside caves)\n"
+                  "        public boolean mobileHideUnderground = true;\n"
+                  "        public int mobileUndergroundDepthChunks = 3;\n")
+              blocks = (opt_block("bool", "mobile_hide_underground", 0, 0, 0, "mobileHideUnderground", "HIGH")
+                        + opt_block("int", "mobile_underground_depth", 1, 8, 1, "mobileUndergroundDepthChunks", "MEDIUM"))
+              lang = lang_lines([
+                  ("sodium.options.mobile_hide_underground.name", "Mobile: Hide Underground"),
+                  ("sodium.options.mobile_hide_underground.tooltip",
+                   "Skips chunk sections far below the surface while you are outside caves. Saves CPU and GPU, but caves and cliff bases seen from outside can look cut off."),
+                  ("sodium.options.mobile_underground_depth.name", "Mobile: Underground Depth"),
+                  ("sodium.options.mobile_underground_depth.tooltip",
+                   "How many chunks below the surface terrain keeps being drawn. Lower hides more."),
+                  ("sodium.options.mobile_underground_depth.value", "%s chunks"),
+              ])
+              add_options(fields, blocks, lang)
+              wr(P_OCC, s)
+              wr(P_TWEAKS, TWEAKS_JAVA)
+
+
+          # ------------------------------------------------------------ mobile page
+          def feature_tab():
+              s = rd(P_CFG)
+              s_lang = rd(P_LANG)
+              head = ('        performancePage.addOptionGroup(builder.createOptionGroup()\n'
+                      '                .addOption(\n'
+                      '                        builder.createIntegerOption(Identifier.parse("sodium:performance.mobile_upload_budget"))')
+              need(s.count(head) == 1, "SodiumConfigBuilder: mobile group start not found")
+              start = s.index(head)
+              end_tok = "\n        );\n"
+              end = s.find(end_tok, start)
+              need(end > 0, "SodiumConfigBuilder: mobile group end not found")
+              end += len(end_tok)
+              group = s[start:end]
+              rest = s[end:]
+              if rest.startswith("\n"):
+                  end += 1
+              s = s[:start] + s[end:]
+              group = group.replace("performancePage", "mobilePage")
+              method = (
+                  "    private OptionPageBuilder buildMobilePage(ConfigBuilder builder) {\n"
+                  '        var mobilePage = builder.createOptionPage().setName(Component.translatable("sodium.options.pages.mobile"));\n'
+                  "\n" + group + "\n"
+                  "        return mobilePage;\n"
+                  "    }\n\n")
+              s = replace_once(s, "    private OptionPageBuilder buildAdvancedPage(ConfigBuilder builder) {",
+                               method + "    private OptionPageBuilder buildAdvancedPage(ConfigBuilder builder) {", "buildAdvancedPage anchor")
+              s = replace_once(s, ".addPage(this.buildPerformancePage(builder))",
+                               ".addPage(this.buildPerformancePage(builder))\n                .addPage(this.buildMobilePage(builder))", "addPage")
+              m = re.search(r'^[ \t]*"sodium\.options\.pages\.performance".*\n', s_lang, re.M)
+              need(m is not None, "en_us.json: pages.performance anchor")
+              s_lang = s_lang[: m.end()] + '  "sodium.options.pages.mobile": "Mobile",\n' + s_lang[m.end():]
+              wr(P_CFG, s); wr(P_LANG, s_lang)
+
+
+          base = ""
+          if os.path.exists("../applied_base.txt"):
+              base = open("../applied_base.txt").read().strip()
+
+          features = (("flat", feature_flat), ("far", feature_far), ("ug", feature_underground), ("tab", feature_tab))
+          if "all" in SKIP:
+              features = ()
+
+          for name, fn in features:
+              if name in SKIP:
+                  print("SKIPPED (by request):", name)
+                  continue
+              # keep a copy so a half-applied feature can be rolled back
+              backup = {}
+              for p in (P_OPTS, P_CFG, P_LANG, P_OCC, P_DCR, P_ABRC, P_FLUID):
+                  backup[p] = rd(p)
+              try:
+                  fn()
+                  applied.append(name)
+                  print("APPLIED:", name)
+              except Skip as e:
+                  for p, c in backup.items():
+                      wr(p, c)
+                  if name == "ug" and os.path.exists(P_TWEAKS):
+                      os.remove(P_TWEAKS)
+                  print("::warning::Sodium Mobile feature '%s' SKIPPED: %s" % (name, e))
+
+          tag = "-".join([t for t in [base] + applied if t])
+          with open("../applied.txt", "w") as f:
+              f.write(tag)
+          print("Features applied:", tag)
+          PY_EOF
+          cp -r sodium-mc1.21.11-0.8.14 snap
+          cp applied.txt applied_base.txt
+          build_attempt() {
+            echo "=== Build attempt, skipping: [$1] ==="
+            rm -rf sodium-mc1.21.11-0.8.14
+            cp -r snap sodium-mc1.21.11-0.8.14
+            ( cd sodium-mc1.21.11-0.8.14 && MOBILE_V12_SKIP="$1" python3 ../v12.py && chmod +x gradlew && ./gradlew :fabric:build -Pbuild.release )
+          }
+          build_attempt "" || build_attempt "ug" || build_attempt "ug,far" || build_attempt "all"
       - name: Collect jar
         run: |
           mkdir out
           JAR=$(ls sodium-mc1.21.11-0.8.14/build/mods/*.jar | head -1)
           TAG=$(cat applied.txt)
-          cp "$JAR" "out/sodium-mobile-1.1-${TAG}-mc1.21.11.jar"
+          cp "$JAR" "out/sodium-mobile-1.2-${TAG}-mc1.21.11.jar"
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: Sodium-Mobile-1.1
+          name: Sodium-Mobile-1.2
           path: out/*.jar
