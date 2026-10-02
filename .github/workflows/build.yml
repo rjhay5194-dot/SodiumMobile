@@ -1,6 +1,6 @@
 name: Build Sodium Mobile
 # One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
-# v1.2: Mobile settings tab, Flat Lighting, Simplified Far Terrain, Hide Underground (auto fallback to v1.1 if one fails to build). v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
+# v1.3: quad LOD replaces simplified far terrain. v1.2: Mobile settings tab, Flat Lighting, Simplified Far Terrain, Hide Underground (auto fallback to v1.1 if one fails to build). v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
 on:
   workflow_dispatch:
   push:
@@ -438,9 +438,9 @@ jobs:
               f.write("-".join(applied))
           PY_EOF
           echo "Features applied: $(cat ../applied.txt)"
-      - name: Build Fabric jar (v1.2 features, falls back to v1.1 if one fails)
+      - name: Build Fabric jar (v1.3 features, falls back step by step if one fails)
         run: |
-          cat > v12.py <<'PY_EOF'
+          cat > v13.py <<'PY_EOF'
           import re, sys, os
 
           BASE = "common/src/main"
@@ -453,6 +453,11 @@ jobs:
           P_ABRC = JAVA + "render/model/AbstractBlockRenderContext.java"
           P_FLUID = JAVA + "render/chunk/compile/pipeline/DefaultFluidRenderer.java"
           P_TWEAKS = JAVA + "render/chunk/MobileTweaks.java"
+          P_LOD = JAVA + "render/chunk/MobileLod.java"
+          P_TASK = JAVA + "render/chunk/compile/tasks/ChunkBuilderMeshingTask.java"
+          P_SECTION = JAVA + "render/chunk/RenderSection.java"
+          P_COLLECTOR = JAVA + "render/chunk/lists/SectionCollector.java"
+          P_RSM = JAVA + "render/chunk/RenderSectionManager.java"
 
           SKIP = [x.strip() for x in os.environ.get("MOBILE_V12_SKIP", "").split(",") if x.strip()]
           applied = []
@@ -557,53 +562,554 @@ jobs:
               wr(P_ABRC, s1); wr(P_FLUID, s2)
 
 
-          # ------------------------------------------------------------ simplified far terrain
-          def feature_far():
-              s = rd(P_DCR)
-              need("slices &= SectionRenderDataUnsafe.getSliceMask(pMeshData);" in s, "DefaultChunkRenderer: slice mask anchor")
-              s = insert_after(
-                  s, "        int originZ = renderRegion.getChunkZ();\n",
-                  "\n"
-                  "        // Sodium Mobile: simplified far terrain. Beyond the start distance only top/bottom faces (mode 1)\n"
-                  "        // or only top faces (mode 2, opaque only) are drawn.\n"
-                  "        final var mobilePerf = net.caffeinemc.mods.sodium.client.SodiumClientMod.options().performance;\n"
-                  "        final int mobileFarMode = mobilePerf.mobileSimplifyFar;\n"
-                  "        final int mobileFarStart = mobilePerf.mobileSimplifyFarStartChunks;\n"
-                  "        final int mobileFarStartSq = mobileFarStart * mobileFarStart;\n"
-                  "        final int mobileCamChunkX = camera.intX >> 4;\n"
-                  "        final int mobileCamChunkZ = camera.intZ >> 4;\n"
-                  "        final int mobileFarKeep = (1 << ModelQuadFacing.UNASSIGNED.ordinal()) | (1 << ModelQuadFacing.POS_Y.ordinal()) | (1 << ModelQuadFacing.NEG_Y.ordinal());\n"
-                  "        final int mobileFarTop = (mobileFarMode >= 2 && !pass.isTranslucent()) ? (1 << ModelQuadFacing.POS_Y.ordinal()) : mobileFarKeep;\n",
-                  "DefaultChunkRenderer locals")
-              s = insert_after(
-                  s, "            slices &= SectionRenderDataUnsafe.getSliceMask(pMeshData);\n",
-                  "\n"
-                  "            if (mobileFarMode > 0) {\n"
-                  "                int mobileDx = chunkX - mobileCamChunkX;\n"
-                  "                int mobileDz = chunkZ - mobileCamChunkZ;\n"
-                  "                if (mobileDx * mobileDx + mobileDz * mobileDz > mobileFarStartSq) {\n"
-                  "                    slices &= mobileFarTop;\n"
+          # ------------------------------------------------------------ quad LOD for the outer ring
+          LOD_JAVA = r'''package net.caffeinemc.mods.sodium.client.render.chunk;
+
+          import net.caffeinemc.mods.sodium.api.util.ColorARGB;
+          import net.caffeinemc.mods.sodium.client.SodiumClientMod;
+          import net.caffeinemc.mods.sodium.client.model.quad.properties.ModelQuadFacing;
+          import net.caffeinemc.mods.sodium.client.render.chunk.compile.ChunkBuildBuffers;
+          import net.caffeinemc.mods.sodium.client.render.chunk.terrain.material.DefaultMaterials;
+          import net.caffeinemc.mods.sodium.client.render.chunk.terrain.material.Material;
+          import net.caffeinemc.mods.sodium.client.render.chunk.vertex.format.ChunkVertexEncoder;
+          import net.caffeinemc.mods.sodium.client.world.LevelSlice;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.renderer.block.model.BakedQuad;
+          import net.minecraft.client.renderer.block.model.BlockModelPart;
+          import net.minecraft.client.renderer.block.BlockModelShaper;
+          import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.tags.FluidTags;
+          import net.minecraft.util.RandomSource;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.levelgen.Heightmap;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+
+          /**
+           * Sodium Mobile: quad LOD for the outer ring of the render distance.
+           * Far chunk sections are meshed as merged NxN top quads plus short walls between height steps,
+           * using the heightmap instead of every block.
+           */
+          public final class MobileLod {
+              private static volatile double cameraX;
+              private static volatile double cameraZ;
+              private static volatile int renderDistance = 8;
+
+              private MobileLod() {
+              }
+
+              public static void setCamera(double x, double z) {
+                  cameraX = x;
+                  cameraZ = z;
+                  renderDistance = Math.max(2, Minecraft.getInstance().options.getEffectiveRenderDistance());
+              }
+
+              private static boolean enabled() {
+                  return SodiumClientMod.options().performance.mobileQuadLod;
+              }
+
+              /** Decides whether a section column should be meshed as LOD, with a little hysteresis so it doesn't flicker. */
+              public static boolean targetLod(int chunkX, int chunkZ, boolean currentlyLod, double camX, double camZ) {
+                  if (!enabled()) {
+                      return false;
+                  }
+
+                  double dx = chunkX - Math.floor(camX / 16.0);
+                  double dz = chunkZ - Math.floor(camZ / 16.0);
+                  double dist = Math.sqrt(dx * dx + dz * dz);
+                  double start = renderDistance * (SodiumClientMod.options().performance.mobileQuadLodStartPercent / 100.0);
+
+                  if (currentlyLod) {
+                      return dist >= start - 1.0;
+                  }
+
+                  return dist >= start;
+              }
+
+              public static boolean targetLod(int chunkX, int chunkZ, boolean currentlyLod) {
+                  return targetLod(chunkX, chunkZ, currentlyLod, cameraX, cameraZ);
+              }
+
+              /** Called for every visited section; queues a rebuild when its LOD state no longer matches. */
+              public static void checkRebuild(RenderSection section) {
+                  if (!section.isBuilt() || section.getRunningJob() != null) {
+                      return;
+                  }
+
+                  if (targetLod(section.getChunkX(), section.getChunkZ(), section.mobileLodBuilt) != section.mobileLodBuilt) {
+                      section.setPendingUpdate(ChunkUpdateTypes.join(section.getPendingUpdate(), ChunkUpdateTypes.REBUILD), System.nanoTime());
+                  }
+              }
+
+              // ------------------------------------------------------------------------------------------------------------
+
+              private static final class Look {
+                  TextureAtlasSprite upSprite;
+                  int upColor = 0xFFFFFFFF;
+                  TextureAtlasSprite sideSprite;
+                  int sideColor = 0xFFFFFFFF;
+                  Material material = DefaultMaterials.SOLID;
+              }
+
+              private static final class Quad {
+                  final Material material;
+                  final ModelQuadFacing facing;
+                  final TextureAtlasSprite sprite;
+                  final ChunkVertexEncoder.Vertex[] vertices = ChunkVertexEncoder.Vertex.uninitializedQuad();
+
+                  Quad(Material material, ModelQuadFacing facing, TextureAtlasSprite sprite) {
+                      this.material = material;
+                      this.facing = facing;
+                      this.sprite = sprite;
+                  }
+              }
+
+              private static final int LIGHT = 15 << 20;
+
+              private static int toColor(int argb) {
+                  return ColorARGB.toABGR(argb);
+              }
+
+              private static int tintColor(Minecraft mc, BlockState state, LevelSlice slice, BlockPos pos, int tintIndex) {
+                  if (tintIndex < 0) {
+                      return 0xFFFFFFFF;
+                  }
+
+                  int rgb = mc.getBlockColors().getColor(state, slice, pos, tintIndex);
+                  return rgb == -1 ? 0xFFFFFFFF : (0xFF000000 | rgb);
+              }
+
+              private static TextureAtlasSprite firstSprite(List<BlockModelPart> parts, Direction dir) {
+                  for (BlockModelPart part : parts) {
+                      List<BakedQuad> quads = part.getQuads(dir);
+                      if (!quads.isEmpty()) {
+                          return quads.get(0).sprite();
+                      }
+                  }
+                  return null;
+              }
+
+              private static int firstTint(List<BlockModelPart> parts, Direction dir) {
+                  for (BlockModelPart part : parts) {
+                      List<BakedQuad> quads = part.getQuads(dir);
+                      if (!quads.isEmpty()) {
+                          return quads.get(0).tintIndex();
+                      }
+                  }
+                  return -1;
+              }
+
+              private static Look lookOf(Minecraft mc, BlockModelShaper shaper, LevelSlice slice, BlockState state, BlockPos pos, HashMap<BlockState, Look> cache) {
+                  Look cached = cache.get(state);
+                  if (cached != null) {
+                      return cached;
+                  }
+
+                  Look look = new Look();
+
+                  if (!state.getFluidState().isEmpty() || state.getRenderShape() != net.minecraft.world.level.block.RenderShape.MODEL) {
+                      // water, lava and anything without a normal model: flat colour on a plain texture
+                      int color = 0xFF3F76E4;
+                      if (state.getFluidState().is(FluidTags.LAVA)) {
+                          color = 0xFFFF8A1F;
+                      } else if (state.getFluidState().isEmpty()) {
+                          color = 0xFF000000 | state.getMapColor(slice, pos).col;
+                      }
+                      Look plain = plainLook(mc, shaper, slice, pos, cache);
+                      look.upSprite = plain.upSprite;
+                      look.sideSprite = plain.sideSprite;
+                      look.upColor = color;
+                      look.sideColor = color;
+                  } else {
+                      List<BlockModelPart> parts = new ArrayList<>();
+                      shaper.getBlockModel(state).collectParts(RandomSource.create(42L), parts);
+
+                      look.upSprite = firstSprite(parts, Direction.UP);
+                      look.upColor = tintColor(mc, state, slice, pos, firstTint(parts, Direction.UP));
+
+                      for (Direction dir : new Direction[]{Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST}) {
+                          look.sideSprite = firstSprite(parts, dir);
+                          if (look.sideSprite != null) {
+                              look.sideColor = tintColor(mc, state, slice, pos, firstTint(parts, dir));
+                              break;
+                          }
+                      }
+
+                      if (look.upSprite == null && look.sideSprite == null) {
+                          Look plain = plainLook(mc, shaper, slice, pos, cache);
+                          look.upSprite = plain.upSprite;
+                          look.sideSprite = plain.sideSprite;
+                          look.upColor = 0xFF000000 | state.getMapColor(slice, pos).col;
+                          look.sideColor = look.upColor;
+                      } else {
+                          if (look.upSprite == null) {
+                              look.upSprite = look.sideSprite;
+                              look.upColor = look.sideColor;
+                          }
+                          if (look.sideSprite == null) {
+                              look.sideSprite = look.upSprite;
+                              look.sideColor = look.upColor;
+                          }
+                          look.material = DefaultMaterials.forBlockState(state);
+                          if (look.material.pass.isTranslucent()) {
+                              // ice, glass: draw as a plain light colour instead
+                              Look plain = plainLook(mc, shaper, slice, pos, cache);
+                              look.upSprite = plain.upSprite;
+                              look.sideSprite = plain.sideSprite;
+                              look.upColor = 0xFF000000 | state.getMapColor(slice, pos).col;
+                              look.sideColor = look.upColor;
+                              look.material = DefaultMaterials.SOLID;
+                          }
+                      }
+                  }
+
+                  cache.put(state, look);
+                  return look;
+              }
+
+              private static Look plainLook(Minecraft mc, BlockModelShaper shaper, LevelSlice slice, BlockPos pos, HashMap<BlockState, Look> cache) {
+                  BlockState plainState = Blocks.WHITE_CONCRETE.defaultBlockState();
+                  Look cached = cache.get(plainState);
+                  if (cached != null) {
+                      return cached;
+                  }
+
+                  Look look = new Look();
+                  List<BlockModelPart> parts = new ArrayList<>();
+                  shaper.getBlockModel(plainState).collectParts(RandomSource.create(42L), parts);
+                  look.upSprite = firstSprite(parts, Direction.UP);
+                  look.sideSprite = firstSprite(parts, Direction.NORTH);
+                  if (look.sideSprite == null) {
+                      look.sideSprite = look.upSprite;
+                  }
+                  cache.put(plainState, look);
+                  return look;
+              }
+
+              // ------------------------------------------------------------------------------------------------------------
+
+              private static int sampleHeight(ClientLevel level, int x, int z) {
+                  int cx = x >> 4;
+                  int cz = z >> 4;
+
+                  if (!level.hasChunk(cx, cz)) {
+                      return Integer.MIN_VALUE;
+                  }
+
+                  return level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
+              }
+
+              private static void put(ChunkVertexEncoder.Vertex v, float x, float y, float z, int color, float shade, float u, float vv) {
+                  v.x = x;
+                  v.y = y;
+                  v.z = z;
+                  v.color = color;
+                  v.ao = shade;
+                  v.u = u;
+                  v.v = vv;
+                  v.light = LIGHT;
+              }
+
+              private static void topQuad(List<Quad> out, Look look, float x0, float x1, float z0, float z1, float y) {
+                  TextureAtlasSprite s = look.upSprite;
+                  Quad q = new Quad(look.material, ModelQuadFacing.POS_Y, s);
+                  int c = toColor(look.upColor);
+                  float u0 = s.getU0(), u1 = s.getU1(), v0 = s.getV0(), v1 = s.getV1();
+                  put(q.vertices[0], x0, y, z0, c, 1.0f, u0, v0);
+                  put(q.vertices[1], x0, y, z1, c, 1.0f, u0, v1);
+                  put(q.vertices[2], x1, y, z1, c, 1.0f, u1, v1);
+                  put(q.vertices[3], x1, y, z0, c, 1.0f, u1, v0);
+                  out.add(q);
+              }
+
+              /** dir: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z. The wall sits on the boundary plane of the group and faces dir. */
+              private static void wallQuad(List<Quad> out, Look look, int dir, float a0, float a1, float plane, float yBottom, float yTop) {
+                  TextureAtlasSprite s = look.sideSprite;
+                  int c = toColor(look.sideColor);
+                  float u0 = s.getU0(), u1 = s.getU1(), v0 = s.getV0(), v1 = s.getV1();
+                  float shade = dir < 2 ? 0.6f : 0.8f;
+                  ModelQuadFacing facing = switch (dir) {
+                      case 0 -> ModelQuadFacing.POS_X;
+                      case 1 -> ModelQuadFacing.NEG_X;
+                      case 2 -> ModelQuadFacing.POS_Z;
+                      default -> ModelQuadFacing.NEG_Z;
+                  };
+                  Quad q = new Quad(look.material, facing, s);
+                  ChunkVertexEncoder.Vertex[] w = q.vertices;
+
+                  switch (dir) {
+                      case 0 -> { // +X, a0..a1 along Z
+                          put(w[0], plane, yTop, a1, c, shade, u0, v0);
+                          put(w[1], plane, yBottom, a1, c, shade, u0, v1);
+                          put(w[2], plane, yBottom, a0, c, shade, u1, v1);
+                          put(w[3], plane, yTop, a0, c, shade, u1, v0);
+                      }
+                      case 1 -> { // -X
+                          put(w[0], plane, yTop, a0, c, shade, u0, v0);
+                          put(w[1], plane, yBottom, a0, c, shade, u0, v1);
+                          put(w[2], plane, yBottom, a1, c, shade, u1, v1);
+                          put(w[3], plane, yTop, a1, c, shade, u1, v0);
+                      }
+                      case 2 -> { // +Z, a0..a1 along X
+                          put(w[0], a0, yTop, plane, c, shade, u0, v0);
+                          put(w[1], a0, yBottom, plane, c, shade, u0, v1);
+                          put(w[2], a1, yBottom, plane, c, shade, u1, v1);
+                          put(w[3], a1, yTop, plane, c, shade, u1, v0);
+                      }
+                      default -> { // -Z
+                          put(w[0], a1, yTop, plane, c, shade, u0, v0);
+                          put(w[1], a1, yBottom, plane, c, shade, u0, v1);
+                          put(w[2], a0, yBottom, plane, c, shade, u1, v1);
+                          put(w[3], a0, yTop, plane, c, shade, u1, v0);
+                      }
+                  }
+
+                  out.add(q);
+              }
+
+              /**
+               * Builds the LOD mesh for one section. Returns false (and adds nothing) if anything is unavailable,
+               * so the caller can fall back to the normal block-by-block mesh.
+               */
+              public static boolean build(ChunkBuildBuffers buffers, BlockModelShaper shaper, LevelSlice slice, int originX, int originY, int originZ) {
+                  Minecraft mc = Minecraft.getInstance();
+                  ClientLevel level = mc.level;
+
+                  if (level == null) {
+                      return false;
+                  }
+
+                  int size = 1 << Math.max(1, Math.min(3, SodiumClientMod.options().performance.mobileQuadLodLevel));
+                  int groups = 16 / size;
+                  int gridSize = groups + 2;
+
+                  // height grid including a one group border (stores top-face y, or MIN_VALUE if unknown) and the sample column that gave it
+                  int[] heights = new int[gridSize * gridSize];
+                  int[] sampleX = new int[gridSize * gridSize];
+                  int[] sampleZ = new int[gridSize * gridSize];
+
+                  int[] offsets = {0, size - 1};
+                  int sampleCount = size == 1 ? 1 : 2;
+
+                  for (int gz = -1; gz <= groups; gz++) {
+                      for (int gx = -1; gx <= groups; gx++) {
+                          int best = Integer.MAX_VALUE;
+                          int bestX = 0;
+                          int bestZ = 0;
+                          boolean known = true;
+
+                          for (int i = 0; i < sampleCount && known; i++) {
+                              for (int j = 0; j < sampleCount; j++) {
+                                  int wx = originX + gx * size + offsets[i];
+                                  int wz = originZ + gz * size + offsets[j];
+                                  int h = sampleHeight(level, wx, wz);
+
+                                  if (h == Integer.MIN_VALUE) {
+                                      known = false;
+                                      break;
+                                  }
+
+                                  if (h < best) {
+                                      best = h;
+                                      bestX = wx;
+                                      bestZ = wz;
+                                  }
+                              }
+                          }
+
+                          int idx = (gz + 1) * gridSize + (gx + 1);
+                          heights[idx] = known ? best : Integer.MIN_VALUE;
+                          sampleX[idx] = bestX;
+                          sampleZ[idx] = bestZ;
+                      }
+                  }
+
+                  int secMinY = originY;
+                  int secMaxY = originY + 16;
+
+                  List<Quad> quads = new ArrayList<>();
+                  HashMap<BlockState, Look> looks = new HashMap<>();
+                  BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+                  int[][] steps = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+                  for (int gz = 0; gz < groups; gz++) {
+                      for (int gx = 0; gx < groups; gx++) {
+                          int idx = (gz + 1) * gridSize + (gx + 1);
+                          int h = heights[idx];
+
+                          if (h == Integer.MIN_VALUE) {
+                              continue;
+                          }
+
+                          float x0 = gx * size;
+                          float x1 = x0 + size;
+                          float z0 = gz * size;
+                          float z1 = z0 + size;
+
+                          BlockState state;
+                          Look look;
+
+                          boolean topHere = h - 1 >= secMinY && h - 1 < secMaxY;
+                          boolean wallHere = false;
+
+                          for (int[] step : steps) {
+                              int hn = heights[(gz + 1 + step[1]) * gridSize + (gx + 1 + step[0])];
+                              if (hn != Integer.MIN_VALUE && hn < h && Math.min(h, secMaxY) > Math.max(hn, secMinY)) {
+                                  wallHere = true;
+                              }
+                          }
+
+                          if (!topHere && !wallHere) {
+                              continue;
+                          }
+
+                          int lookY = Math.max(secMinY, Math.min(secMaxY - 1, h - 1));
+                          int lx = sampleX[idx];
+                          int lz = sampleZ[idx];
+
+                          // use the real top block when it is inside this section, otherwise the block at the section edge
+                          pos.set(lx, lookY, lz);
+                          state = slice.getBlockState(lx, lookY, lz);
+
+                          if (state.isAir()) {
+                              // air at the sampled spot (e.g. top block is above/below this section): look for the nearest solid below
+                              int yy = lookY;
+                              while (yy > secMinY && slice.getBlockState(lx, yy, lz).isAir()) {
+                                  yy--;
+                              }
+                              pos.set(lx, yy, lz);
+                              state = slice.getBlockState(lx, yy, lz);
+                              if (state.isAir()) {
+                                  continue;
+                              }
+                          }
+
+                          look = lookOf(mc, shaper, slice, state, pos, looks);
+
+                          if (look.upSprite == null || look.sideSprite == null) {
+                              continue;
+                          }
+
+                          if (h - 1 >= secMinY && h - 1 < secMaxY) {
+                              topQuad(quads, look, x0, x1, z0, z1, h - secMinY);
+                          }
+
+                          for (int dir = 0; dir < 4; dir++) {
+                              int[] step = steps[dir];
+                              int hn = heights[(gz + 1 + step[1]) * gridSize + (gx + 1 + step[0])];
+
+                              if (hn == Integer.MIN_VALUE || hn >= h) {
+                                  continue;
+                              }
+
+                              int bottom = Math.max(hn, secMinY);
+                              int top = Math.min(h, secMaxY);
+
+                              if (top <= bottom) {
+                                  continue;
+                              }
+
+                              float yb = bottom - secMinY;
+                              float yt = top - secMinY;
+
+                              switch (dir) {
+                                  case 0 -> wallQuad(quads, look, 0, z0, z1, x1, yb, yt);
+                                  case 1 -> wallQuad(quads, look, 1, z0, z1, x0, yb, yt);
+                                  case 2 -> wallQuad(quads, look, 2, x0, x1, z1, yb, yt);
+                                  default -> wallQuad(quads, look, 3, x0, x1, z0, yb, yt);
+                              }
+                          }
+                      }
+                  }
+
+                  // everything computed successfully: now write to the buffers
+                  for (Quad q : quads) {
+                      var builder = buffers.get(q.material);
+                      builder.getVertexBuffer(q.facing).push(q.vertices, q.material.bits());
+                      builder.addSprite(q.sprite);
+                  }
+
+                  return true;
+              }
+          }
+          '''
+
+
+          def feature_lod():
+              s_task = rd(P_TASK)
+              s_sec = rd(P_SECTION)
+              s_col = rd(P_COLLECTOR)
+              s_rsm = rd(P_RSM)
+
+              s_task = replace_once(
+                  s_task,
+                  "        profiler.push(\"render blocks\");\n        try {\n            for (int y = minY; y < maxY; y++) {\n",
+                  "        int mobileLoopMaxY = maxY;\n"
+                  "        {\n"
+                  "            boolean mobileLod = net.caffeinemc.mods.sodium.client.render.chunk.MobileLod.targetLod(\n"
+                  "                    this.render.getChunkX(), this.render.getChunkZ(), this.render.mobileLodBuilt,\n"
+                  "                    this.absoluteCameraPos.x(), this.absoluteCameraPos.z());\n"
+                  "            if (mobileLod) {\n"
+                  "                try {\n"
+                  "                    if (net.caffeinemc.mods.sodium.client.render.chunk.MobileLod.build(buffers, cache.getBlockModels(), slice, minX, minY, minZ)) {\n"
+                  "                        mobileLoopMaxY = minY;\n"
+                  "                    } else {\n"
+                  "                        mobileLod = false;\n"
+                  "                    }\n"
+                  "                } catch (Throwable mobileError) {\n"
+                  "                    mobileLod = false;\n"
                   "                }\n"
-                  "            }\n",
-                  "DefaultChunkRenderer mask")
+                  "            }\n"
+                  "            this.render.mobileLodBuilt = mobileLod;\n"
+                  "        }\n\n"
+                  "        profiler.push(\"render blocks\");\n        try {\n            for (int y = minY; y < mobileLoopMaxY; y++) {\n",
+                  "ChunkBuilderMeshingTask")
+              s_sec = replace_once(
+                  s_sec, "    private boolean built = false; // merge with the flags?\n",
+                  "    private boolean built = false; // merge with the flags?\n    public boolean mobileLodBuilt = false; // Sodium Mobile: last build used the quad LOD mesh\n",
+                  "RenderSection")
+              s_col = replace_once(
+                  s_col, "        // always add to rebuild lists though, because it might just not be built yet\n",
+                  "        net.caffeinemc.mods.sodium.client.render.chunk.MobileLod.checkRebuild(section);\n\n"
+                  "        // always add to rebuild lists though, because it might just not be built yet\n",
+                  "SectionCollector")
+              s_rsm = replace_once(
+                  s_rsm, "        this.cameraPosition = cameraPosition;\n    }\n\n    public void update(",
+                  "        net.caffeinemc.mods.sodium.client.render.chunk.MobileLod.setCamera(cameraPosition.x(), cameraPosition.z());\n"
+                  "        this.cameraPosition = cameraPosition;\n    }\n\n    public void update(",
+                  "RenderSectionManager")
+
               fields = (
-                  "        // Sodium Mobile: simplified far terrain (0 = off, 1 = no side faces, 2 = top faces only) and where it starts\n"
-                  "        public int mobileSimplifyFar = 1;\n"
-                  "        public int mobileSimplifyFarStartChunks = 6;\n")
-              blocks = (opt_block("int", "mobile_simplify_far", 0, 2, 1, "mobileSimplifyFar", "HIGH")
-                        + opt_block("int", "mobile_simplify_far_start", 2, 32, 1, "mobileSimplifyFarStartChunks", "MEDIUM"))
+                  "        // Sodium Mobile: quad LOD for the outer ring of the render distance (level 1/2/3 = 2x2/4x4/8x8 blocks per quad)\n"
+                  "        public boolean mobileQuadLod = true;\n"
+                  "        public int mobileQuadLodLevel = 2;\n"
+                  "        public int mobileQuadLodStartPercent = 75;\n")
+              blocks = (opt_block("bool", "mobile_quad_lod", 0, 0, 0, "mobileQuadLod", "HIGH", True)
+                        + opt_block("int", "mobile_quad_lod_level", 1, 3, 1, "mobileQuadLodLevel", "MEDIUM", True)
+                        + opt_block("int", "mobile_quad_lod_start", 40, 95, 5, "mobileQuadLodStartPercent", "MEDIUM", True))
               lang = lang_lines([
-                  ("sodium.options.mobile_simplify_far.name", "Mobile: Simplified Far Terrain"),
-                  ("sodium.options.mobile_simplify_far.tooltip",
-                   "Distant terrain skips most of its geometry. Level 1 drops the side faces of blocks, level 2 draws only top faces. Big FPS gain, but cliffs and hills far away get holes. 0 is off."),
-                  ("sodium.options.mobile_simplify_far.value", "Level %s"),
-                  ("sodium.options.mobile_simplify_far_start.name", "Mobile: Simplified Terrain Start"),
-                  ("sodium.options.mobile_simplify_far_start.tooltip",
-                   "How many chunks away from you the simplified terrain begins."),
-                  ("sodium.options.mobile_simplify_far_start.value", "%s chunks"),
+                  ("sodium.options.mobile_quad_lod.name", "Mobile: Quad LOD"),
+                  ("sodium.options.mobile_quad_lod.tooltip",
+                   "The outer ring of your render distance is drawn as merged flat quads with small walls between height steps, instead of every block. Far terrain looks blockier but costs far less."),
+                  ("sodium.options.mobile_quad_lod_level.name", "Mobile: Quad LOD Size"),
+                  ("sodium.options.mobile_quad_lod_level.tooltip",
+                   "How many blocks one quad covers. Level 1 = 2x2, level 2 = 4x4, level 3 = 8x8. Bigger is faster but blockier."),
+                  ("sodium.options.mobile_quad_lod_level.value", "Level %s"),
+                  ("sodium.options.mobile_quad_lod_start.name", "Mobile: Quad LOD Start"),
+                  ("sodium.options.mobile_quad_lod_start.tooltip",
+                   "Where the quad LOD begins, as a percentage of your render distance. 75% means the outer quarter."),
+                  ("sodium.options.mobile_quad_lod_start.value", "%s%%"),
               ])
               add_options(fields, blocks, lang)
-              wr(P_DCR, s)
+              wr(P_TASK, s_task); wr(P_SECTION, s_sec); wr(P_COLLECTOR, s_col); wr(P_RSM, s_rsm)
+              wr(P_LOD, LOD_JAVA)
 
 
           # ------------------------------------------------------------ hide underground sections
@@ -758,7 +1264,7 @@ jobs:
           if os.path.exists("../applied_base.txt"):
               base = open("../applied_base.txt").read().strip()
 
-          features = (("flat", feature_flat), ("far", feature_far), ("ug", feature_underground), ("tab", feature_tab))
+          features = (("flat", feature_flat), ("quad", feature_lod), ("ug", feature_underground), ("tab", feature_tab))
           if "all" in SKIP:
               features = ()
 
@@ -768,7 +1274,7 @@ jobs:
                   continue
               # keep a copy so a half-applied feature can be rolled back
               backup = {}
-              for p in (P_OPTS, P_CFG, P_LANG, P_OCC, P_DCR, P_ABRC, P_FLUID):
+              for p in (P_OPTS, P_CFG, P_LANG, P_OCC, P_ABRC, P_FLUID, P_TASK, P_SECTION, P_COLLECTOR, P_RSM):
                   backup[p] = rd(p)
               try:
                   fn()
@@ -779,6 +1285,8 @@ jobs:
                       wr(p, c)
                   if name == "ug" and os.path.exists(P_TWEAKS):
                       os.remove(P_TWEAKS)
+                  if name == "quad" and os.path.exists(P_LOD):
+                      os.remove(P_LOD)
                   print("::warning::Sodium Mobile feature '%s' SKIPPED: %s" % (name, e))
 
           tag = "-".join([t for t in [base] + applied if t])
@@ -792,17 +1300,17 @@ jobs:
             echo "=== Build attempt, skipping: [$1] ==="
             rm -rf sodium-mc1.21.11-0.8.14
             cp -r snap sodium-mc1.21.11-0.8.14
-            ( cd sodium-mc1.21.11-0.8.14 && MOBILE_V12_SKIP="$1" python3 ../v12.py && chmod +x gradlew && ./gradlew :fabric:build -Pbuild.release )
+            ( cd sodium-mc1.21.11-0.8.14 && MOBILE_V12_SKIP="$1" python3 ../v13.py && chmod +x gradlew && ./gradlew :fabric:build -Pbuild.release )
           }
-          build_attempt "" || build_attempt "ug" || build_attempt "ug,far" || build_attempt "all"
+          build_attempt "" || build_attempt "ug" || build_attempt "ug,quad" || build_attempt "all"
       - name: Collect jar
         run: |
           mkdir out
           JAR=$(ls sodium-mc1.21.11-0.8.14/build/mods/*.jar | head -1)
           TAG=$(cat applied.txt)
-          cp "$JAR" "out/sodium-mobile-1.2-${TAG}-mc1.21.11.jar"
+          cp "$JAR" "out/sodium-mobile-1.3-${TAG}-mc1.21.11.jar"
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: Sodium-Mobile-1.2
+          name: Sodium-Mobile-1.3
           path: out/*.jar
