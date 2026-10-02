@@ -1,6 +1,7 @@
 name: Build Sodium Mobile
 # One-file build: downloads official Sodium 0.8.14 (Minecraft 1.21.11) source, applies the mobile patch, builds the Fabric jar.
-# v1.4: tiered quad LOD (2x2 / 4x4 / 8x8 getting coarser with distance), layered cliff sides (grass/dirt/stone), per-position biome tint, gap-free tier borders. Falls back to the v1.3 quad LOD if v1.4 fails to build.
+# v1.5: LOD start / 1x1 / 4x4 / 8x8 sliders in chunks, new 1x1 tier, adaptive 2x2, tree canopy slabs, water depth shading, edge fog, presets, grass strip fix. Falls back step by step (no fog, then the v1.3 quad LOD) if a part fails to build.
+# v1.4: tiered quad LOD (2x2 / 4x4 / 8x8 getting coarser with distance), layered cliff sides (grass/dirt/stone), per-position biome tint, gap-free tier borders.
 # v1.3: quad LOD replaces simplified far terrain. v1.2: Mobile settings tab, Flat Lighting, Simplified Far Terrain, Hide Underground (auto fallback to v1.1 if one fails to build). v1.1b: budget hunk moved from git patch to a tolerant script step. v1.1: adds Far Chunk Culling and Far Texture Detail (distance-based texture LOD) on top of v1.0.
 on:
   workflow_dispatch:
@@ -439,7 +440,7 @@ jobs:
               f.write("-".join(applied))
           PY_EOF
           echo "Features applied: $(cat ../applied.txt)"
-      - name: Build Fabric jar (v1.4 features, falls back step by step if one fails)
+      - name: Build Fabric jar (v1.5 features, falls back step by step if one fails)
         run: |
           cat > v13.py <<'PY_EOF'
           import re, sys, os
@@ -1043,7 +1044,7 @@ jobs:
           '''
 
 
-          LOD_JAVA_V14 = r'''package net.caffeinemc.mods.sodium.client.render.chunk;
+          LOD_JAVA_V15 = r'''package net.caffeinemc.mods.sodium.client.render.chunk;
 
           import net.caffeinemc.mods.sodium.api.util.ColorARGB;
           import net.caffeinemc.mods.sodium.client.SodiumClientMod;
@@ -1061,6 +1062,7 @@ jobs:
           import net.minecraft.client.renderer.texture.TextureAtlasSprite;
           import net.minecraft.core.BlockPos;
           import net.minecraft.core.Direction;
+          import net.minecraft.tags.BlockTags;
           import net.minecraft.tags.FluidTags;
           import net.minecraft.util.RandomSource;
           import net.minecraft.world.level.block.Blocks;
@@ -1073,16 +1075,27 @@ jobs:
           import java.util.concurrent.ConcurrentHashMap;
 
           /**
-           * Sodium Mobile v1.4: tiered quad LOD for the outer ring of the render distance.
-           * Tier 1/2/3 = 2x2 / 4x4 / 8x8 blocks per quad, getting coarser with distance. Cliff walls are split into layers
-           * using the real blocks (grass cap, dirt, stone) instead of copying the top block onto the whole wall.
+           * Sodium Mobile v1.5: tiered quad LOD.
+           * Codes: 0 = normal blocks, 1 = 1x1 (one quad per column), 2 = 2x2 (columns, flat 2x2 groups merged),
+           * 3 = 4x4, 4 = 8x8. Where each code starts is set in chunks from the camera.
+           * Ground height ignores leaves, trees are drawn as a thin canopy slab, cliff walls are layered from the real blocks.
            */
           public final class MobileLod {
               private static volatile double cameraX;
               private static volatile double cameraZ;
-              private static volatile int renderDistance = 8;
 
-              /** tier each LOD section was last built with, keyed by section position */
+              private static volatile int cfgStart = 6;
+              private static volatile int cfg1x1 = 8;
+              private static volatile int cfgT2 = 11;
+              private static volatile int cfgT3 = 14;
+              private static volatile int cfgMax = 3;
+              private static volatile int cfgTrees = 1;
+              private static volatile boolean cfgLayered = true;
+              private static volatile boolean cfgWater = true;
+
+              private static final int[][] STEPS = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+              /** code each LOD section was last built with, keyed by section position */
               private static final ConcurrentHashMap<Long, Integer> BUILT_TIER = new ConcurrentHashMap<>();
 
               private MobileLod() {
@@ -1091,7 +1104,7 @@ jobs:
               public static void setCamera(double x, double z) {
                   cameraX = x;
                   cameraZ = z;
-                  renderDistance = Math.max(2, Minecraft.getInstance().options.getEffectiveRenderDistance());
+                  refreshConfig();
 
                   if (BUILT_TIER.size() > 60000) {
                       BUILT_TIER.clear();
@@ -1102,48 +1115,123 @@ jobs:
                   return SodiumClientMod.options().performance.mobileQuadLod;
               }
 
+              /** presets override the individual sliders; preset 0 (custom) uses them */
+              private static void refreshConfig() {
+                  var p = SodiumClientMod.options().performance;
+                  int start;
+                  int a;
+                  int b;
+                  int c;
+                  int max;
+                  int trees;
+                  boolean layered;
+                  boolean water;
+
+                  switch (p.mobileLodPreset) {
+                      case 1 -> { // potato
+                          start = 5;
+                          a = 0;
+                          b = 7;
+                          c = 9;
+                          max = 3;
+                          trees = 0;
+                          layered = false;
+                          water = false;
+                      }
+                      case 2 -> { // balanced
+                          start = 6;
+                          a = 8;
+                          b = 11;
+                          c = 14;
+                          max = 3;
+                          trees = 1;
+                          layered = true;
+                          water = true;
+                      }
+                      case 3 -> { // quality
+                          start = 6;
+                          a = 10;
+                          b = 13;
+                          c = 18;
+                          max = 3;
+                          trees = 2;
+                          layered = true;
+                          water = true;
+                      }
+                      default -> {
+                          start = p.mobileLodStartChunks;
+                          a = p.mobileLod1x1Chunks;
+                          b = p.mobileLodTier2Chunks;
+                          c = p.mobileLodTier3Chunks;
+                          max = p.mobileQuadLodLevel;
+                          trees = p.mobileLodTrees;
+                          layered = p.mobileLodLayeredSides;
+                          water = p.mobileLodWaterDepth;
+                      }
+                  }
+
+                  cfgStart = Math.max(1, start);
+                  cfg1x1 = Math.max(0, a);
+                  cfgT2 = Math.max(0, b);
+                  cfgT3 = Math.max(0, c);
+                  cfgMax = Math.max(1, Math.min(3, max));
+                  cfgTrees = Math.max(0, Math.min(2, trees));
+                  cfgLayered = layered;
+                  cfgWater = water;
+              }
+
               private static long sectionKey(int x, int y, int z) {
                   return (((long) (x & 0x3FFFFF)) << 42) | (((long) (z & 0x3FFFFF)) << 20) | ((long) (y & 0xFFFFF));
               }
 
-              /** 0 = normal blocks, 1..3 = LOD with 2/4/8 blocks per quad. Has hysteresis so it does not flicker. */
-              public static int tierAt(int chunkX, int chunkZ, int currentTier, double camX, double camZ) {
+              private static boolean canopyOk(int code) {
+                  int t = cfgTrees;
+                  if (t >= 2) {
+                      return code <= 3;
+                  }
+                  return t == 1 && code <= 2;
+              }
+
+              /** 0 = normal blocks, 1..4 = LOD code. Has a half-chunk hysteresis so borders do not flicker. */
+              public static int tierAt(int chunkX, int chunkZ, int currentCode, double camX, double camZ) {
                   if (!enabled()) {
                       return 0;
                   }
 
-                  var perf = SodiumClientMod.options().performance;
                   double dx = chunkX - Math.floor(camX / 16.0);
                   double dz = chunkZ - Math.floor(camZ / 16.0);
                   double dist = Math.sqrt(dx * dx + dz * dz);
-                  double start = renderDistance * (perf.mobileQuadLodStartPercent / 100.0);
+                  double z1 = cfgStart;
 
-                  if (currentTier > 0) {
-                      if (dist < start - 1.0) {
+                  if (currentCode > 0) {
+                      if (dist < z1 - 1.0) {
                           return 0;
                       }
-                  } else if (dist < start) {
+                  } else if (dist < z1) {
                       return 0;
                   }
 
-                  int max = Math.max(1, Math.min(3, perf.mobileQuadLodLevel));
+                  double z2 = cfg1x1 > cfgStart ? cfg1x1 : z1;
+                  double z3 = Math.max((double) cfgT2, z2);
+                  double z4 = Math.max((double) cfgT3, z3);
+                  int maxCode = cfgMax + 1;
 
-                  if (max == 1 || !perf.mobileQuadLodTiers) {
-                      return max;
+                  int raw = dist < z2 ? 1 : (dist < z3 ? 2 : (dist < z4 ? 3 : 4));
+
+                  if (raw > maxCode) {
+                      raw = maxCode;
                   }
 
-                  double span = Math.max(1.0, renderDistance + 1.0 - start);
-                  double p = 1.0 + (dist - start) / span * max;
-                  int tier = (int) Math.floor(p);
+                  if (currentCode > 0 && currentCode != raw && currentCode <= maxCode) {
+                      double lo = currentCode == 1 ? z1 : (currentCode == 2 ? z2 : (currentCode == 3 ? z3 : z4));
+                      double hi = currentCode >= maxCode ? 1.0e9 : (currentCode == 1 ? z2 : (currentCode == 2 ? z3 : z4));
 
-                  if (currentTier > 0) {
-                      double margin = 0.6 * max / span;
-                      if (p >= currentTier - margin && p < currentTier + 1 + margin) {
-                          tier = currentTier;
+                      if (hi > lo && dist >= lo - 0.5 && dist < hi + 0.5) {
+                          raw = currentCode;
                       }
                   }
 
-                  return Math.max(1, Math.min(max, tier));
+                  return raw;
               }
 
               public static boolean targetLod(int chunkX, int chunkZ, boolean currentlyLod, double camX, double camZ) {
@@ -1154,7 +1242,7 @@ jobs:
                   return targetLod(chunkX, chunkZ, currentlyLod, cameraX, cameraZ);
               }
 
-              /** Called for every visited section; queues a rebuild when its LOD tier no longer matches. */
+              /** Called for every visited section; queues a rebuild when its LOD code no longer matches. */
               public static void checkRebuild(RenderSection section) {
                   if (!section.isBuilt() || section.getRunningJob() != null) {
                       return;
@@ -1300,6 +1388,14 @@ jobs:
                               look.sideColor = look.upColor;
                               look.sideTint = look.upTint;
                           }
+
+                          // grassy blocks: use the top texture and tint on the sides too, so far cliffs have no bright green strip
+                          if (state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.PODZOL) || state.is(Blocks.MYCELIUM)) {
+                              look.sideSprite = look.upSprite;
+                              look.sideColor = look.upColor;
+                              look.sideTint = look.upTint;
+                          }
+
                           look.material = DefaultMaterials.forBlockState(state);
                           if (look.material.pass.isTranslucent()) {
                               // ice, glass: draw as a plain light colour instead
@@ -1340,88 +1436,41 @@ jobs:
 
               // ------------------------------------------------------------------------------------------------------------
 
-              private static int sampleHeight(ClientLevel level, int x, int z) {
-                  int cx = x >> 4;
-                  int cz = z >> 4;
-
-                  if (!level.hasChunk(cx, cz)) {
-                      return Integer.MIN_VALUE;
-                  }
-
-                  return level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
-              }
-
-              /** height of one s x s cell whose corner is (cx, cz): the lowest of its corner samples, like the mesher does */
-              private static int cellHeight(ClientLevel level, int cx, int cz, int s) {
-                  if (s <= 1) {
-                      return sampleHeight(level, cx, cz);
-                  }
-
-                  int best = Integer.MAX_VALUE;
-                  int far = s - 1;
-
-                  for (int i = 0; i < 2; i++) {
-                      for (int j = 0; j < 2; j++) {
-                          int h = sampleHeight(level, cx + (i == 0 ? 0 : far), cz + (j == 0 ? 0 : far));
-
-                          if (h == Integer.MIN_VALUE) {
-                              return Integer.MIN_VALUE;
-                          }
-
-                          if (h < best) {
-                              best = h;
-                          }
-                      }
-                  }
-
-                  return best;
-              }
-
-              private static int minOver(ClientLevel level, int ex0, int ex1, int ez0, int ez1, int nSize, int best) {
-                  if (best == Integer.MIN_VALUE) {
-                      return best;
-                  }
-
-                  int mask = ~(nSize - 1);
-
-                  for (int x = ex0 & mask; x <= ex1; x += nSize) {
-                      for (int z = ez0 & mask; z <= ez1; z += nSize) {
-                          int h = cellHeight(level, x, z, nSize);
-
-                          if (h == Integer.MIN_VALUE) {
-                              return Integer.MIN_VALUE;
-                          }
-
-                          if (h < best) {
-                              best = h;
-                          }
-                      }
-                  }
-
-                  return best;
-              }
-
               /**
-               * Height used for the wall decision against a neighbouring chunk. Takes the lowest of the real columns and of the
-               * neighbour's own LOD cells, so a wall always reaches below whatever the neighbour draws and no gaps open between tiers.
+               * Reads one world column. out[0] = top (first free y above the highest motion blocking block, leaves included),
+               * out[1] = ground (same, but looking down through leaves, logs and plants of a tree).
                */
-              private static int borderHeight(ClientLevel level, int ex0, int ex1, int ez0, int ez1, int originY) {
-                  int ncx = ex0 >> 4;
-                  int ncz = ez0 >> 4;
-                  int fresh = tierAt(ncx, ncz, 0, cameraX, cameraZ);
-                  Integer mapped = BUILT_TIER.get(sectionKey(ncx, originY >> 4, ncz));
-
-                  int best = minOver(level, ex0, ex1, ez0, ez1, 1, Integer.MAX_VALUE);
-
-                  if (fresh > 0) {
-                      best = minOver(level, ex0, ex1, ez0, ez1, 1 << fresh, best);
+              private static boolean column(ClientLevel level, BlockPos.MutableBlockPos p, int x, int z, int[] out) {
+                  if (!level.hasChunk(x >> 4, z >> 4)) {
+                      return false;
                   }
 
-                  if (mapped != null && mapped > 0 && mapped != fresh) {
-                      best = minOver(level, ex0, ex1, ez0, ez1, 1 << Math.min(3, mapped), best);
+                  int h = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
+                  int g = h;
+                  boolean leaves = false;
+
+                  for (int y = h - 1; y > h - 48; y--) {
+                      p.set(x, y, z);
+                      BlockState s = level.getBlockState(p);
+
+                      if (s.isAir()) {
+                          if (!leaves) {
+                              break;
+                          }
+                          g = y;
+                      } else if (s.is(BlockTags.LEAVES)) {
+                          leaves = true;
+                          g = y;
+                      } else if (leaves && (s.is(BlockTags.LOGS) || s.getCollisionShape(level, p).isEmpty())) {
+                          g = y;
+                      } else {
+                          break;
+                      }
                   }
 
-                  return best;
+                  out[0] = h;
+                  out[1] = g;
+                  return true;
               }
 
               private static void put(ChunkVertexEncoder.Vertex v, float x, float y, float z, int color, float shade, float u, float vv) {
@@ -1458,7 +1507,7 @@ jobs:
                   out.add(q);
               }
 
-              /** dir: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z. The wall sits on the boundary plane of the group and faces dir. */
+              /** dir: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z. The wall sits on the boundary plane of the cell and faces dir. */
               private static void wallQuad(List<Quad> out, Look look, int argb, int dir, float a0, float a1, float plane, float yBottom, float yTop, float crop) {
                   TextureAtlasSprite s = look.sideSprite;
                   int c = toColor(argb);
@@ -1577,6 +1626,17 @@ jobs:
                   }
               }
 
+              private static int shadeWater(int argb, int depth) {
+                  float f = Math.min(1.0f, depth / 24.0f);
+                  float k = 1.15f - 0.65f * f;
+                  int r = Math.min(255, (int) (((argb >> 16) & 255) * k));
+                  int g = Math.min(255, (int) (((argb >> 8) & 255) * k));
+                  int b = Math.min(255, (int) ((argb & 255) * k));
+                  return 0xFF000000 | (r << 16) | (g << 8) | b;
+              }
+
+              // ------------------------------------------------------------------------------------------------------------
+
               /**
                * Builds the LOD mesh for one section. Returns false (and adds nothing) if anything is unavailable,
                * so the caller can fall back to the normal block-by-block mesh.
@@ -1589,238 +1649,659 @@ jobs:
                       return false;
                   }
 
-                  var perf = SodiumClientMod.options().performance;
-
                   long skey = sectionKey(originX >> 4, originY >> 4, originZ >> 4);
                   Integer prev = BUILT_TIER.get(skey);
-                  int tier = tierAt(originX >> 4, originZ >> 4, prev == null ? 0 : prev, cameraX, cameraZ);
+                  int code = tierAt(originX >> 4, originZ >> 4, prev == null ? 0 : prev, cameraX, cameraZ);
 
-                  if (tier < 1) {
-                      tier = 1;
+                  if (code < 1) {
+                      code = 1;
                   }
 
-                  int size = 1 << tier;
-                  int groups = 16 / size;
-                  int gridSize = groups + 2;
-                  float crop = tier == 1 ? 1.0f : (tier == 2 ? 0.5f : 0.25f);
-                  boolean layered = perf.mobileLodLayeredSides;
-
-                  // height grid including a one group border (stores top-face y, or MIN_VALUE if unknown) and the sample column that gave it
-                  int[] heights = new int[gridSize * gridSize];
-                  int[] sampleX = new int[gridSize * gridSize];
-                  int[] sampleZ = new int[gridSize * gridSize];
-
-                  int[] offsets = {0, size - 1};
-
-                  for (int gz = -1; gz <= groups; gz++) {
-                      for (int gx = -1; gx <= groups; gx++) {
-                          int idx = (gz + 1) * gridSize + (gx + 1);
-
-                          if (gx < 0 || gx >= groups || gz < 0 || gz >= groups) {
-                              int ex0;
-                              int ex1;
-                              int ez0;
-                              int ez1;
-
-                              if (gx < 0) {
-                                  ex0 = originX - 1;
-                                  ex1 = ex0;
-                              } else if (gx >= groups) {
-                                  ex0 = originX + 16;
-                                  ex1 = ex0;
-                              } else {
-                                  ex0 = originX + gx * size;
-                                  ex1 = ex0 + size - 1;
-                              }
-
-                              if (gz < 0) {
-                                  ez0 = originZ - 1;
-                                  ez1 = ez0;
-                              } else if (gz >= groups) {
-                                  ez0 = originZ + 16;
-                                  ez1 = ez0;
-                              } else {
-                                  ez0 = originZ + gz * size;
-                                  ez1 = ez0 + size - 1;
-                              }
-
-                              heights[idx] = borderHeight(level, ex0, ex1, ez0, ez1, originY);
-                              continue;
-                          }
-
-                          int best = Integer.MAX_VALUE;
-                          int bestX = 0;
-                          int bestZ = 0;
-                          boolean known = true;
-
-                          for (int i = 0; i < 2 && known; i++) {
-                              for (int j = 0; j < 2; j++) {
-                                  int wx = originX + gx * size + offsets[i];
-                                  int wz = originZ + gz * size + offsets[j];
-                                  int h = sampleHeight(level, wx, wz);
-
-                                  if (h == Integer.MIN_VALUE) {
-                                      known = false;
-                                      break;
-                                  }
-
-                                  if (h < best) {
-                                      best = h;
-                                      bestX = wx;
-                                      bestZ = wz;
-                                  }
-                              }
-                          }
-
-                          heights[idx] = known ? best : Integer.MIN_VALUE;
-                          sampleX[idx] = bestX;
-                          sampleZ[idx] = bestZ;
-                      }
-                  }
-
-                  int secMinY = originY;
-                  int secMaxY = originY + 16;
-
-                  List<Quad> quads = new ArrayList<>();
-                  HashMap<BlockState, Look> looks = new HashMap<>();
-                  BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-
-                  int[][] steps = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-
-                  for (int gz = 0; gz < groups; gz++) {
-                      for (int gx = 0; gx < groups; gx++) {
-                          int idx = (gz + 1) * gridSize + (gx + 1);
-                          int h = heights[idx];
-
-                          if (h == Integer.MIN_VALUE) {
-                              continue;
-                          }
-
-                          float x0 = gx * size;
-                          float x1 = x0 + size;
-                          float z0 = gz * size;
-                          float z1 = z0 + size;
-
-                          BlockState state;
-                          Look look;
-
-                          boolean topHere = h - 1 >= secMinY && h - 1 < secMaxY;
-                          boolean wallHere = false;
-
-                          for (int[] step : steps) {
-                              int hn = heights[(gz + 1 + step[1]) * gridSize + (gx + 1 + step[0])];
-                              if (hn != Integer.MIN_VALUE && hn < h && Math.min(h, secMaxY) > Math.max(hn, secMinY)) {
-                                  wallHere = true;
-                              }
-                          }
-
-                          if (!topHere && !wallHere) {
-                              continue;
-                          }
-
-                          int lookY = Math.max(secMinY, Math.min(secMaxY - 1, h - 1));
-                          int lx = sampleX[idx];
-                          int lz = sampleZ[idx];
-
-                          // use the real top block when it is inside this section, otherwise the block at the section edge
-                          pos.set(lx, lookY, lz);
-                          state = slice.getBlockState(lx, lookY, lz);
-
-                          if (state.isAir()) {
-                              // air at the sampled spot: look for the nearest solid below
-                              int yy = lookY;
-                              while (yy > secMinY && slice.getBlockState(lx, yy, lz).isAir()) {
-                                  yy--;
-                              }
-                              pos.set(lx, yy, lz);
-                              state = slice.getBlockState(lx, yy, lz);
-                              if (state.isAir()) {
-                                  continue;
-                              }
-                          }
-
-                          look = lookOf(mc, shaper, slice, state, pos, looks);
-
-                          if (look.upSprite == null || look.sideSprite == null) {
-                              continue;
-                          }
-
-                          // colours are read per position, so the biome tint blends smoothly from group to group
-                          int topColor = upColorAt(mc, state, look, slice, pos);
-                          int sideColor = sideColorAt(mc, state, look, slice, pos);
-
-                          if (topHere) {
-                              topQuad(quads, look, topColor, x0, x1, z0, z1, h - secMinY, crop);
-                          }
-
-                          for (int dir = 0; dir < 4; dir++) {
-                              int[] step = steps[dir];
-                              int hn = heights[(gz + 1 + step[1]) * gridSize + (gx + 1 + step[0])];
-
-                              if (hn == Integer.MIN_VALUE || hn >= h) {
-                                  continue;
-                              }
-
-                              int bottom = Math.max(hn, secMinY);
-                              int top = Math.min(h, secMaxY);
-
-                              if (top <= bottom) {
-                                  continue;
-                              }
-
-                              float a0;
-                              float a1;
-                              float plane;
-
-                              switch (dir) {
-                                  case 0 -> {
-                                      a0 = z0;
-                                      a1 = z1;
-                                      plane = x1;
-                                  }
-                                  case 1 -> {
-                                      a0 = z0;
-                                      a1 = z1;
-                                      plane = x0;
-                                  }
-                                  case 2 -> {
-                                      a0 = x0;
-                                      a1 = x1;
-                                      plane = z1;
-                                  }
-                                  default -> {
-                                      a0 = x0;
-                                      a1 = x1;
-                                      plane = z0;
-                                  }
-                              }
-
-                              if (layered) {
-                                  wallBands(quads, mc, shaper, slice, pos, looks, look, sideColor, lx, lz, dir,
-                                          a0, a1, plane, bottom, top, secMinY, h <= secMaxY, size, crop);
-                              } else {
-                                  wallQuad(quads, look, sideColor, dir, a0, a1, plane, (float) (bottom - secMinY), (float) (top - secMinY), crop);
-                              }
-                          }
-                      }
-                  }
+                  Mesher m = new Mesher(mc, level, shaper, slice, originX, originY, originZ, code);
+                  m.run();
 
                   // everything computed successfully: now write to the buffers
-                  for (Quad q : quads) {
+                  for (Quad q : m.quads) {
                       var builder = buffers.get(q.material);
                       builder.getVertexBuffer(q.facing).push(q.vertices, q.material.bits());
                       builder.addSprite(q.sprite);
                   }
 
-                  BUILT_TIER.put(skey, tier);
+                  BUILT_TIER.put(skey, code);
                   return true;
+              }
+
+              private static final class Mesher {
+                  final Minecraft mc;
+                  final ClientLevel level;
+                  final BlockModelShaper shaper;
+                  final LevelSlice slice;
+                  final int originX;
+                  final int originY;
+                  final int originZ;
+                  final int code;
+                  final int rs;
+                  final int groups;
+                  final int gridSize;
+                  final int secMinY;
+                  final int secMaxY;
+                  final int minThick;
+                  final float crop;
+                  final boolean layered;
+                  final boolean canopyOn;
+                  final boolean water;
+                  final boolean mergeFlat;
+
+                  final int[] gH;
+                  final int[] cH;
+                  final int[] sX;
+                  final int[] sZ;
+                  final int[] gBy;
+                  final int[] cBy;
+                  final BlockState[] gState;
+                  final BlockState[] cState;
+
+                  final List<Quad> quads = new ArrayList<>();
+                  final HashMap<BlockState, Look> looks = new HashMap<>();
+                  final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+                  final BlockPos.MutableBlockPos wp = new BlockPos.MutableBlockPos();
+                  final int[] col = new int[2];
+                  final int[] tmp = new int[4];
+                  final int[] res = new int[4];
+
+                  Mesher(Minecraft mc, ClientLevel level, BlockModelShaper shaper, LevelSlice slice, int originX, int originY, int originZ, int code) {
+                      this.mc = mc;
+                      this.level = level;
+                      this.shaper = shaper;
+                      this.slice = slice;
+                      this.originX = originX;
+                      this.originY = originY;
+                      this.originZ = originZ;
+                      this.code = code;
+                      this.rs = code <= 2 ? 1 : (1 << (code - 1));
+                      this.groups = 16 / this.rs;
+                      this.gridSize = this.groups + 2;
+                      this.secMinY = originY;
+                      this.secMaxY = originY + 16;
+                      this.minThick = Math.max(2, this.rs);
+                      this.crop = code <= 2 ? 1.0f : (code == 3 ? 0.5f : 0.25f);
+                      this.layered = cfgLayered;
+                      this.canopyOn = canopyOk(code);
+                      this.water = cfgWater;
+                      this.mergeFlat = code == 2;
+
+                      int n = this.gridSize * this.gridSize;
+                      this.gH = new int[n];
+                      this.cH = new int[n];
+                      this.sX = new int[n];
+                      this.sZ = new int[n];
+                      this.gBy = new int[n];
+                      this.cBy = new int[n];
+                      this.gState = new BlockState[n];
+                      this.cState = new BlockState[n];
+                  }
+
+                  void run() {
+                      sampleGrid();
+                      prepareStates();
+                      emitAll();
+                  }
+
+                  // ---- sampling -------------------------------------------------------------------------------------------
+
+                  void sampleGrid() {
+                      for (int gz = -1; gz <= groups; gz++) {
+                          for (int gx = -1; gx <= groups; gx++) {
+                              int idx = (gz + 1) * gridSize + (gx + 1);
+
+                              if (gx < 0 || gx >= groups || gz < 0 || gz >= groups) {
+                                  int ex0;
+                                  int ex1;
+                                  int ez0;
+                                  int ez1;
+
+                                  if (gx < 0) {
+                                      ex0 = originX - 1;
+                                      ex1 = ex0;
+                                  } else if (gx >= groups) {
+                                      ex0 = originX + 16;
+                                      ex1 = ex0;
+                                  } else {
+                                      ex0 = originX + gx * rs;
+                                      ex1 = ex0 + rs - 1;
+                                  }
+
+                                  if (gz < 0) {
+                                      ez0 = originZ - 1;
+                                      ez1 = ez0;
+                                  } else if (gz >= groups) {
+                                      ez0 = originZ + 16;
+                                      ez1 = ez0;
+                                  } else {
+                                      ez0 = originZ + gz * rs;
+                                      ez1 = ez0 + rs - 1;
+                                  }
+
+                                  int g = borderGround(ex0, ex1, ez0, ez1);
+                                  gH[idx] = g;
+                                  cH[idx] = (canopyOn && g != Integer.MIN_VALUE) ? borderCanopy(ex0, ex1, ez0, ez1, g) : 0;
+                                  continue;
+                              }
+
+                              if (!cellSample(originX + gx * rs, originZ + gz * rs)) {
+                                  gH[idx] = Integer.MIN_VALUE;
+                                  continue;
+                              }
+
+                              gH[idx] = res[0];
+                              cH[idx] = res[1];
+                              sX[idx] = res[2];
+                              sZ[idx] = res[3];
+                          }
+                      }
+                  }
+
+                  /** samples one cell (the column itself for 1x1, the average of 4 corner columns for 4x4 and 8x8) */
+                  boolean cellSample(int x0, int z0) {
+                      int n = rs == 1 ? 1 : 4;
+                      int far = rs - 1;
+                      int sumG = 0;
+                      int sumH = 0;
+                      boolean allCanopy = true;
+
+                      for (int i = 0; i < n; i++) {
+                          int x = x0 + ((i & 1) == 0 ? 0 : far);
+                          int z = z0 + ((i & 2) == 0 ? 0 : far);
+
+                          if (!column(level, wp, x, z, col)) {
+                              return false;
+                          }
+
+                          tmp[i] = col[1];
+                          sumG += col[1];
+                          sumH += col[0];
+
+                          if (col[0] - col[1] < 3) {
+                              allCanopy = false;
+                          }
+                      }
+
+                      int g = Math.round((float) sumG / n);
+                      int h = Math.round((float) sumH / n);
+
+                      int best = 0;
+                      int bd = Integer.MAX_VALUE;
+                      for (int i = 0; i < n; i++) {
+                          int d = Math.abs(tmp[i] - g);
+                          if (d < bd) {
+                              bd = d;
+                              best = i;
+                          }
+                      }
+
+                      res[2] = x0 + ((best & 1) == 0 ? 0 : far);
+                      res[3] = z0 + ((best & 2) == 0 ? 0 : far);
+
+                      if (canopyOn) {
+                          if (allCanopy) {
+                              res[0] = g;
+                              res[1] = h;
+                          } else {
+                              res[0] = (h - g < 3) ? h : g;
+                              res[1] = 0;
+                          }
+                      } else {
+                          res[0] = g;
+                          res[1] = 0;
+                      }
+
+                      return true;
+                  }
+
+                  int cellMin(int x0, int z0, int s, boolean canopy) {
+                      int far = s - 1;
+                      int n = s == 1 ? 1 : 4;
+                      int best = Integer.MAX_VALUE;
+
+                      for (int i = 0; i < n; i++) {
+                          int x = x0 + ((i & 1) == 0 ? 0 : far);
+                          int z = z0 + ((i & 2) == 0 ? 0 : far);
+
+                          if (!column(level, wp, x, z, col)) {
+                              return Integer.MIN_VALUE;
+                          }
+
+                          int v = canopy ? (col[0] - col[1] >= 3 ? col[0] : col[1]) : col[1];
+
+                          if (v < best) {
+                              best = v;
+                          }
+                      }
+
+                      return best;
+                  }
+
+                  int minOver(int ex0, int ex1, int ez0, int ez1, int nSize, int best, boolean canopy) {
+                      if (best == Integer.MIN_VALUE) {
+                          return best;
+                      }
+
+                      int mask = ~(nSize - 1);
+
+                      for (int x = ex0 & mask; x <= ex1; x += nSize) {
+                          for (int z = ez0 & mask; z <= ez1; z += nSize) {
+                              int h = cellMin(x, z, nSize, canopy);
+
+                              if (h == Integer.MIN_VALUE) {
+                                  return Integer.MIN_VALUE;
+                              }
+
+                              if (h < best) {
+                                  best = h;
+                              }
+                          }
+                      }
+
+                      return best;
+                  }
+
+                  /**
+                   * Ground height on the far side of a section border. Takes the lowest of the real columns and of the
+                   * neighbour's own big cells, so a wall always reaches below whatever the neighbour draws and no gaps open between tiers.
+                   */
+                  int borderGround(int ex0, int ex1, int ez0, int ez1) {
+                      int ncx = ex0 >> 4;
+                      int ncz = ez0 >> 4;
+                      int fresh = tierAt(ncx, ncz, 0, cameraX, cameraZ);
+                      Integer mapped = BUILT_TIER.get(sectionKey(ncx, originY >> 4, ncz));
+
+                      int best = minOver(ex0, ex1, ez0, ez1, 1, Integer.MAX_VALUE, false);
+
+                      if (fresh >= 3) {
+                          best = minOver(ex0, ex1, ez0, ez1, 1 << (fresh - 1), best, false);
+                      }
+
+                      if (mapped != null && mapped >= 3 && mapped != fresh) {
+                          best = minOver(ex0, ex1, ez0, ez1, 1 << (Math.min(4, mapped) - 1), best, false);
+                      }
+
+                      return best;
+                  }
+
+                  /** top of the neighbour's canopy (or its ground if it draws no canopy there) */
+                  int borderCanopy(int ex0, int ex1, int ez0, int ez1, int groundBorder) {
+                      int ncx = ex0 >> 4;
+                      int ncz = ez0 >> 4;
+                      int fresh = tierAt(ncx, ncz, 0, cameraX, cameraZ);
+                      boolean present = fresh == 0 || canopyOk(fresh);
+
+                      if (!present) {
+                          return groundBorder;
+                      }
+
+                      int best = minOver(ex0, ex1, ez0, ez1, 1, Integer.MAX_VALUE, true);
+
+                      if (fresh >= 3) {
+                          best = minOver(ex0, ex1, ez0, ez1, 1 << (fresh - 1), best, true);
+                      }
+
+                      return best == Integer.MIN_VALUE ? groundBorder : best;
+                  }
+
+                  // ---- block states ---------------------------------------------------------------------------------------
+
+                  void prepareStates() {
+                      for (int gz = 0; gz < groups; gz++) {
+                          for (int gx = 0; gx < groups; gx++) {
+                              int idx = (gz + 1) * gridSize + (gx + 1);
+
+                              if (gH[idx] == Integer.MIN_VALUE) {
+                                  continue;
+                              }
+
+                              int lx = sX[idx];
+                              int lz = sZ[idx];
+
+                              int ly = Math.max(secMinY, Math.min(secMaxY - 1, gH[idx] - 1));
+                              BlockState st = slice.getBlockState(lx, ly, lz);
+
+                              if (st.isAir()) {
+                                  while (ly > secMinY && slice.getBlockState(lx, ly, lz).isAir()) {
+                                      ly--;
+                                  }
+                                  st = slice.getBlockState(lx, ly, lz);
+                                  if (st.isAir()) {
+                                      st = null;
+                                  }
+                              }
+
+                              gState[idx] = st;
+                              gBy[idx] = ly;
+
+                              if (cH[idx] > 0) {
+                                  int cy = Math.max(secMinY, Math.min(secMaxY - 1, cH[idx] - 1));
+                                  BlockState cs = slice.getBlockState(lx, cy, lz);
+
+                                  if (cs.isAir()) {
+                                      while (cy > secMinY && slice.getBlockState(lx, cy, lz).isAir()) {
+                                          cy--;
+                                      }
+                                      cs = slice.getBlockState(lx, cy, lz);
+                                      if (cs.isAir()) {
+                                          cs = null;
+                                      }
+                                  }
+
+                                  cState[idx] = cs;
+                                  cBy[idx] = cy;
+                              }
+                          }
+                      }
+                  }
+
+                  // ---- water ----------------------------------------------------------------------------------------------
+
+                  int waterColor(BlockState state, int color, int x, int y, int z) {
+                      if (!water || !state.getFluidState().is(FluidTags.WATER)) {
+                          return color;
+                      }
+
+                      int depth = 0;
+
+                      for (int yy = y; yy > y - 40; yy--) {
+                          wp.set(x, yy, z);
+
+                          if (level.getBlockState(wp).getFluidState().isEmpty()) {
+                              break;
+                          }
+
+                          depth++;
+                      }
+
+                      return shadeWater(color, depth);
+                  }
+
+                  Look lookFor(BlockState st, int lx, int by, int lz) {
+                      pos.set(lx, by, lz);
+                      Look l = lookOf(mc, shaper, slice, st, pos, looks);
+                      return (l.upSprite == null || l.sideSprite == null) ? null : l;
+                  }
+
+                  // ---- emitting -------------------------------------------------------------------------------------------
+
+                  void emitAll() {
+                      int n = gridSize * gridSize;
+                      boolean[] skipG = new boolean[n];
+                      boolean[] skipC = new boolean[n];
+
+                      if (mergeFlat) {
+                          mergeFlatTops(skipG, skipC);
+                      }
+
+                      for (int gz = 0; gz < groups; gz++) {
+                          for (int gx = 0; gx < groups; gx++) {
+                              int idx = (gz + 1) * gridSize + (gx + 1);
+
+                              if (gH[idx] == Integer.MIN_VALUE) {
+                                  continue;
+                              }
+
+                              emitGround(gx, gz, idx, skipG[idx]);
+
+                              if (cH[idx] > 0 && cState[idx] != null) {
+                                  emitCanopy(gx, gz, idx, skipC[idx]);
+                              }
+                          }
+                      }
+                  }
+
+                  /** 2x2 mode: where four neighbouring columns have the same height and block, draw one big top quad instead of four */
+                  void mergeFlatTops(boolean[] skipG, boolean[] skipC) {
+                      for (int gz = 0; gz + 1 < groups; gz += 2) {
+                          for (int gx = 0; gx + 1 < groups; gx += 2) {
+                              int i0 = (gz + 1) * gridSize + (gx + 1);
+                              int i1 = i0 + 1;
+                              int i2 = i0 + gridSize;
+                              int i3 = i2 + 1;
+
+                              int h = gH[i0];
+
+                              if (h != Integer.MIN_VALUE && h - 1 >= secMinY && h - 1 < secMaxY
+                                      && gH[i1] == h && gH[i2] == h && gH[i3] == h
+                                      && gState[i0] != null && gState[i1] == gState[i0] && gState[i2] == gState[i0] && gState[i3] == gState[i0]) {
+                                  Look look = lookFor(gState[i0], sX[i0], gBy[i0], sZ[i0]);
+
+                                  if (look != null) {
+                                      int color = waterColor(gState[i0], upColorAt(mc, gState[i0], look, slice, pos), sX[i0], gBy[i0], sZ[i0]);
+                                      topQuad(quads, look, color, gx, gx + 2, gz, gz + 2, (float) (h - secMinY), 1.0f);
+                                      skipG[i0] = true;
+                                      skipG[i1] = true;
+                                      skipG[i2] = true;
+                                      skipG[i3] = true;
+                                  }
+                              }
+
+                              int c = cH[i0];
+
+                              if (c > 0 && c - 1 >= secMinY && c - 1 < secMaxY
+                                      && cH[i1] == c && cH[i2] == c && cH[i3] == c
+                                      && cState[i0] != null && cState[i1] == cState[i0] && cState[i2] == cState[i0] && cState[i3] == cState[i0]) {
+                                  Look look = lookFor(cState[i0], sX[i0], cBy[i0], sZ[i0]);
+
+                                  if (look != null) {
+                                      int color = upColorAt(mc, cState[i0], look, slice, pos);
+                                      topQuad(quads, look, color, gx, gx + 2, gz, gz + 2, (float) (c - secMinY), 1.0f);
+                                      skipC[i0] = true;
+                                      skipC[i1] = true;
+                                      skipC[i2] = true;
+                                      skipC[i3] = true;
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  void emitGround(int gx, int gz, int idx, boolean skipTop) {
+                      int h = gH[idx];
+                      BlockState state = gState[idx];
+
+                      if (state == null) {
+                          return;
+                      }
+
+                      boolean topHere = h - 1 >= secMinY && h - 1 < secMaxY;
+                      boolean wallHere = false;
+
+                      for (int[] st : STEPS) {
+                          int hn = gH[(gz + 1 + st[1]) * gridSize + (gx + 1 + st[0])];
+
+                          if (hn != Integer.MIN_VALUE && hn < h && Math.min(h, secMaxY) > Math.max(hn, secMinY)) {
+                              wallHere = true;
+                          }
+                      }
+
+                      if (!topHere && !wallHere) {
+                          return;
+                      }
+
+                      int lx = sX[idx];
+                      int lz = sZ[idx];
+                      Look look = lookFor(state, lx, gBy[idx], lz);
+
+                      if (look == null) {
+                          return;
+                      }
+
+                      // colours are read per position, so the biome tint blends smoothly from cell to cell
+                      int topColor = upColorAt(mc, state, look, slice, pos);
+                      int sideColor = sideColorAt(mc, state, look, slice, pos);
+
+                      float x0 = gx * rs;
+                      float x1 = x0 + rs;
+                      float z0 = gz * rs;
+                      float z1 = z0 + rs;
+
+                      if (topHere && !skipTop) {
+                          topQuad(quads, look, waterColor(state, topColor, lx, gBy[idx], lz), x0, x1, z0, z1, (float) (h - secMinY), crop);
+                      }
+
+                      for (int dir = 0; dir < 4; dir++) {
+                          int[] st = STEPS[dir];
+                          int hn = gH[(gz + 1 + st[1]) * gridSize + (gx + 1 + st[0])];
+
+                          if (hn == Integer.MIN_VALUE || hn >= h) {
+                              continue;
+                          }
+
+                          int bottom = Math.max(hn, secMinY);
+                          int top = Math.min(h, secMaxY);
+
+                          if (top <= bottom) {
+                              continue;
+                          }
+
+                          float a0;
+                          float a1;
+                          float plane;
+
+                          switch (dir) {
+                              case 0 -> {
+                                  a0 = z0;
+                                  a1 = z1;
+                                  plane = x1;
+                              }
+                              case 1 -> {
+                                  a0 = z0;
+                                  a1 = z1;
+                                  plane = x0;
+                              }
+                              case 2 -> {
+                                  a0 = x0;
+                                  a1 = x1;
+                                  plane = z1;
+                              }
+                              default -> {
+                                  a0 = x0;
+                                  a1 = x1;
+                                  plane = z0;
+                              }
+                          }
+
+                          if (layered) {
+                              wallBands(quads, mc, shaper, slice, pos, looks, look, sideColor, lx, lz, dir,
+                                      a0, a1, plane, bottom, top, secMinY, h <= secMaxY, minThick, crop);
+                          } else {
+                              wallQuad(quads, look, sideColor, dir, a0, a1, plane, (float) (bottom - secMinY), (float) (top - secMinY), crop);
+                          }
+                      }
+                  }
+
+                  /** a tree canopy: a thin slab of leaves (up to 3 blocks) at the top of the tree, with the ground visible below it */
+                  void emitCanopy(int gx, int gz, int idx, boolean skipTop) {
+                      int c = cH[idx];
+                      int g = gH[idx];
+                      int cb = Math.max(g, c - 3);
+                      BlockState state = cState[idx];
+
+                      boolean topHere = c - 1 >= secMinY && c - 1 < secMaxY;
+                      boolean wallHere = false;
+
+                      for (int[] st : STEPS) {
+                          int ni = (gz + 1 + st[1]) * gridSize + (gx + 1 + st[0]);
+
+                          if (gH[ni] == Integer.MIN_VALUE) {
+                              continue;
+                          }
+
+                          int cn = cH[ni] > 0 ? cH[ni] : gH[ni];
+
+                          if (cn < c && Math.min(c, secMaxY) > Math.max(Math.max(cn, cb), secMinY)) {
+                              wallHere = true;
+                          }
+                      }
+
+                      if (!topHere && !wallHere) {
+                          return;
+                      }
+
+                      int lx = sX[idx];
+                      int lz = sZ[idx];
+                      Look look = lookFor(state, lx, cBy[idx], lz);
+
+                      if (look == null) {
+                          return;
+                      }
+
+                      int topColor = upColorAt(mc, state, look, slice, pos);
+                      int sideColor = sideColorAt(mc, state, look, slice, pos);
+
+                      float x0 = gx * rs;
+                      float x1 = x0 + rs;
+                      float z0 = gz * rs;
+                      float z1 = z0 + rs;
+
+                      if (topHere && !skipTop) {
+                          topQuad(quads, look, topColor, x0, x1, z0, z1, (float) (c - secMinY), crop);
+                      }
+
+                      for (int dir = 0; dir < 4; dir++) {
+                          int[] st = STEPS[dir];
+                          int ni = (gz + 1 + st[1]) * gridSize + (gx + 1 + st[0]);
+
+                          if (gH[ni] == Integer.MIN_VALUE) {
+                              continue;
+                          }
+
+                          int cn = cH[ni] > 0 ? cH[ni] : gH[ni];
+
+                          if (cn >= c) {
+                              continue;
+                          }
+
+                          int bottom = Math.max(Math.max(cn, cb), secMinY);
+                          int top = Math.min(c, secMaxY);
+
+                          if (top <= bottom) {
+                              continue;
+                          }
+
+                          float a0;
+                          float a1;
+                          float plane;
+
+                          switch (dir) {
+                              case 0 -> {
+                                  a0 = z0;
+                                  a1 = z1;
+                                  plane = x1;
+                              }
+                              case 1 -> {
+                                  a0 = z0;
+                                  a1 = z1;
+                                  plane = x0;
+                              }
+                              case 2 -> {
+                                  a0 = x0;
+                                  a1 = x1;
+                                  plane = z1;
+                              }
+                              default -> {
+                                  a0 = x0;
+                                  a1 = x1;
+                                  plane = z0;
+                              }
+                          }
+
+                          wallQuad(quads, look, sideColor, dir, a0, a1, plane, (float) (bottom - secMinY), (float) (top - secMinY), crop);
+                      }
+                  }
               }
           }
           '''
 
 
           def feature_lod():
-              v14 = "quad4" not in SKIP
+              v15 = "quad15" not in SKIP
               s_task = rd(P_TASK)
               s_sec = rd(P_SECTION)
               s_col = rd(P_COLLECTOR)
@@ -1885,41 +2366,71 @@ jobs:
                    "Where the quad LOD begins, as a percentage of your render distance. 75% means the outer quarter."),
                   ("sodium.options.mobile_quad_lod_start.value", "%s%%"),
               ])
-              if v14:
+              if v15:
                   fields = (
-                      "        // Sodium Mobile v1.4: tiered quad LOD (size grows with distance) and layered cliff sides\n"
+                      "        // Sodium Mobile v1.5: tiered quad LOD, distances in chunks from the camera\n"
                       "        public boolean mobileQuadLod = true;\n"
                       "        public int mobileQuadLodLevel = 3;\n"
-                      "        public int mobileQuadLodStartPercent = 60;\n"
-                      "        public boolean mobileQuadLodTiers = true;\n"
-                      "        public boolean mobileLodLayeredSides = true;\n")
+                      "        public int mobileLodPreset = 0;\n"
+                      "        public int mobileLodStartChunks = 6;\n"
+                      "        public int mobileLod1x1Chunks = 8;\n"
+                      "        public int mobileLodTier2Chunks = 11;\n"
+                      "        public int mobileLodTier3Chunks = 14;\n"
+                      "        public int mobileLodTrees = 1;\n"
+                      "        public boolean mobileLodLayeredSides = true;\n"
+                      "        public boolean mobileLodWaterDepth = true;\n")
                   blocks = (opt_block("bool", "mobile_quad_lod", 0, 0, 0, "mobileQuadLod", "HIGH", True)
+                            + opt_block("int", "mobile_lod_preset", 0, 3, 1, "mobileLodPreset", "LOW", True)
                             + opt_block("int", "mobile_quad_lod_level", 1, 3, 1, "mobileQuadLodLevel", "MEDIUM", True)
-                            + opt_block("int", "mobile_quad_lod_start", 40, 95, 5, "mobileQuadLodStartPercent", "MEDIUM", True)
-                            + opt_block("bool", "mobile_quad_lod_tiers", 0, 0, 0, "mobileQuadLodTiers", "MEDIUM", True)
-                            + opt_block("bool", "mobile_lod_layered_sides", 0, 0, 0, "mobileLodLayeredSides", "LOW", True))
+                            + opt_block("int", "mobile_lod_start", 2, 32, 1, "mobileLodStartChunks", "MEDIUM", True)
+                            + opt_block("int", "mobile_lod_1x1", 0, 32, 1, "mobileLod1x1Chunks", "MEDIUM", True)
+                            + opt_block("int", "mobile_lod_tier2", 2, 32, 1, "mobileLodTier2Chunks", "MEDIUM", True)
+                            + opt_block("int", "mobile_lod_tier3", 2, 32, 1, "mobileLodTier3Chunks", "MEDIUM", True)
+                            + opt_block("int", "mobile_lod_trees", 0, 2, 1, "mobileLodTrees", "MEDIUM", True)
+                            + opt_block("bool", "mobile_lod_layered_sides", 0, 0, 0, "mobileLodLayeredSides", "LOW", True)
+                            + opt_block("bool", "mobile_lod_water_depth", 0, 0, 0, "mobileLodWaterDepth", "LOW", True))
                   lang = lang_lines([
                       ("sodium.options.mobile_quad_lod.name", "Mobile: Quad LOD"),
                       ("sodium.options.mobile_quad_lod.tooltip",
                        "The outer part of your render distance is drawn as merged flat quads instead of every block. Far terrain looks simpler but costs far less."),
-                      ("sodium.options.mobile_quad_lod_level.name", "Mobile: Quad LOD Max Size"),
+                      ("sodium.options.mobile_lod_preset.name", "Mobile: LOD Preset"),
+                      ("sodium.options.mobile_lod_preset.tooltip",
+                       "0 = Custom (use the sliders below), 1 = Potato, 2 = Balanced, 3 = Quality. A preset replaces the LOD sliders, trees, layered cliffs and water shading with its own values."),
+                      ("sodium.options.mobile_lod_preset.value", "Preset %s"),
+                      ("sodium.options.mobile_quad_lod_level.name", "Mobile: LOD Coarsest Size"),
                       ("sodium.options.mobile_quad_lod_level.tooltip",
-                       "Blocks per quad at the farthest edge. Level 1 = 2x2, level 2 = 4x4, level 3 = 8x8. With Distance Tiers on, quads grow from 2x2 up to this size."),
+                       "How coarse the farthest tier gets. Level 1 = stop at 2x2, level 2 = up to 4x4, level 3 = up to 8x8."),
                       ("sodium.options.mobile_quad_lod_level.value", "Level %s"),
-                      ("sodium.options.mobile_quad_lod_start.name", "Mobile: Quad LOD Start"),
-                      ("sodium.options.mobile_quad_lod_start.tooltip",
-                       "Where the LOD begins, as a percentage of your render distance. 60% means the outer 40%."),
-                      ("sodium.options.mobile_quad_lod_start.value", "%s%%"),
-                      ("sodium.options.mobile_quad_lod_tiers.name", "Mobile: LOD Distance Tiers"),
-                      ("sodium.options.mobile_quad_lod_tiers.tooltip",
-                       "Detail drops step by step with distance: fine near the start, coarse at the edge. Off = one size for the whole LOD ring."),
+                      ("sodium.options.mobile_lod_start.name", "Mobile: LOD Start"),
+                      ("sodium.options.mobile_lod_start.tooltip",
+                       "Distance in chunks where the LOD begins. Closer than this you see normal blocks. Has to be lower than your render distance to be visible."),
+                      ("sodium.options.mobile_lod_start.value", "%s chunks"),
+                      ("sodium.options.mobile_lod_1x1.name", "Mobile: 1x1 Detail Until"),
+                      ("sodium.options.mobile_lod_1x1.tooltip",
+                       "Distance in chunks where the finest tier (one quad per block column, true texture size) ends and 2x2 begins. 0 turns the 1x1 tier off."),
+                      ("sodium.options.mobile_lod_1x1.value", "%s chunks"),
+                      ("sodium.options.mobile_lod_tier2.name", "Mobile: 4x4 Starts At"),
+                      ("sodium.options.mobile_lod_tier2.tooltip",
+                       "Distance in chunks where 2x2 quads switch to 4x4. Kept in order automatically, it cannot start before the tier before it."),
+                      ("sodium.options.mobile_lod_tier2.value", "%s chunks"),
+                      ("sodium.options.mobile_lod_tier3.name", "Mobile: 8x8 Starts At"),
+                      ("sodium.options.mobile_lod_tier3.tooltip",
+                       "Distance in chunks where 4x4 quads switch to 8x8. Only used when Coarsest Size is level 3."),
+                      ("sodium.options.mobile_lod_tier3.value", "%s chunks"),
+                      ("sodium.options.mobile_lod_trees.name", "Mobile: LOD Trees"),
+                      ("sodium.options.mobile_lod_trees.tooltip",
+                       "0 = no trees, 1 = low (thin leaf canopy in the closer tiers), 2 = high (canopy up to 4x4). Terrain under trees stays smooth."),
+                      ("sodium.options.mobile_lod_trees.value", "Level %s"),
                       ("sodium.options.mobile_lod_layered_sides.name", "Mobile: LOD Layered Cliffs"),
                       ("sodium.options.mobile_lod_layered_sides.tooltip",
-                       "Cliff walls use the real blocks (grass cap, dirt, stone) instead of copying the top block colour onto the whole wall."),
+                       "Cliff walls use the real blocks (grass cap, dirt, stone) instead of copying the top block onto the whole wall."),
+                      ("sodium.options.mobile_lod_water_depth.name", "Mobile: LOD Water Depth"),
+                      ("sodium.options.mobile_lod_water_depth.tooltip",
+                       "Shallow water is drawn lighter and deep water darker in the LOD."),
                   ])
               add_options(fields, blocks, lang)
               wr(P_TASK, s_task); wr(P_SECTION, s_sec); wr(P_COLLECTOR, s_col); wr(P_RSM, s_rsm)
-              wr(P_LOD, LOD_JAVA_V14 if v14 else LOD_JAVA_V13)
+              wr(P_LOD, LOD_JAVA_V15 if v15 else LOD_JAVA_V13)
 
 
           # ------------------------------------------------------------ hide underground sections
@@ -2035,6 +2546,76 @@ jobs:
               wr(P_TWEAKS, TWEAKS_JAVA)
 
 
+
+          # ------------------------------------------------------------ edge fog for the LOD
+          P_DSI = JAVA + "render/chunk/shader/DefaultShaderInterface.java"
+          P_FSH = BASE + "/resources/assets/sodium/shaders/blocks/block_layer_opaque.fsh"
+
+
+          def feature_fog():
+              s_dsi, s_fsh = rd(P_DSI), rd(P_FSH)
+              has_cull = "mobileFarCullPercent" in rd(P_OPTS)
+
+              s_dsi = insert_after(
+                  s_dsi, "    private final GlUniformBool uniformFastSampling;\n",
+                  "    private final GlUniformFloat2v uniformMobileFog;\n", "DefaultShaderInterface field")
+              s_dsi = insert_after(
+                  s_dsi, '        this.uniformFastSampling = context.bindUniform("u_FastSampling", GlUniformBool::new);\n',
+                  '        this.uniformMobileFog = context.bindUniform("u_MobileFog", GlUniformFloat2v::new);\n',
+                  "DefaultShaderInterface bind")
+              cull = ("            if (mfp.mobileFarCullPercent < 100) {\n"
+                      "                mfEnd = mfEnd * (mfp.mobileFarCullPercent / 100.0f);\n"
+                      "            }\n") if has_cull else ""
+              s_dsi = insert_after(
+                  s_dsi,
+                  "        this.uniformFastSampling.setBool(SodiumClientMod.options().performance.mobileFastTextureSampling);\n",
+                  "        {\n"
+                  "            var mfp = SodiumClientMod.options().performance;\n"
+                  "            float mfStart = 0.0f;\n"
+                  "            float mfEnd = 0.0f;\n"
+                  "            if (mfp.mobileLodFog && mfp.mobileQuadLod) {\n"
+                  "                mfEnd = Minecraft.getInstance().options.getEffectiveRenderDistance() * 16.0f;\n"
+                  + cull +
+                  "                mfStart = Math.max(16.0f, mfEnd - mfp.mobileLodFogWidth * 16.0f);\n"
+                  "            }\n"
+                  "            this.uniformMobileFog.set(new float[] { mfStart, mfEnd });\n"
+                  "        }\n",
+                  "DefaultShaderInterface set")
+
+              need(s_fsh.count("uniform vec2 u_RenderFog; // The start and end position for border fog\n") == 1, "fsh: u_RenderFog anchor")
+              need(s_fsh.count("    fragColor = _linearFog(color, v_FragDistance, u_FogColor, u_EnvironmentFog, u_RenderFog, fadeFactor);\n") == 1, "fsh: fragColor anchor")
+              s_fsh = s_fsh.replace(
+                  "uniform vec2 u_RenderFog; // The start and end position for border fog\n",
+                  "uniform vec2 u_RenderFog; // The start and end position for border fog\n"
+                  "uniform vec2 u_MobileFog; // Sodium Mobile: LOD edge fog, start and end distance in blocks (equal = off)\n", 1)
+              s_fsh = s_fsh.replace(
+                  "    fragColor = _linearFog(color, v_FragDistance, u_FogColor, u_EnvironmentFog, u_RenderFog, fadeFactor);\n",
+                  "    fragColor = _linearFog(color, v_FragDistance, u_FogColor, u_EnvironmentFog, u_RenderFog, fadeFactor);\n"
+                  "#ifdef USE_FOG\n"
+                  "    if (u_MobileFog.y > u_MobileFog.x) {\n"
+                  "        float mobileFog = clamp((v_FragDistance.x - u_MobileFog.x) / (u_MobileFog.y - u_MobileFog.x), 0.0, 1.0);\n"
+                  "        fragColor.rgb = mix(fragColor.rgb, u_FogColor.rgb, mobileFog * u_FogColor.a);\n"
+                  "    }\n"
+                  "#endif\n", 1)
+
+              fields = (
+                  "        // Sodium Mobile v1.5: fade the end of the render distance into the fog colour\n"
+                  "        public boolean mobileLodFog = true;\n"
+                  "        public int mobileLodFogWidth = 3;\n")
+              blocks = (opt_block("bool", "mobile_lod_fog", 0, 0, 0, "mobileLodFog", "LOW")
+                        + opt_block("int", "mobile_lod_fog_width", 1, 8, 1, "mobileLodFogWidth", "LOW"))
+              lang = lang_lines([
+                  ("sodium.options.mobile_lod_fog.name", "Mobile: LOD Edge Fog"),
+                  ("sodium.options.mobile_lod_fog.tooltip",
+                   "Fades the far end of the terrain into the fog colour so the LOD blends into the sky instead of cutting off. Needs Quad LOD on."),
+                  ("sodium.options.mobile_lod_fog_width.name", "Mobile: LOD Fog Width"),
+                  ("sodium.options.mobile_lod_fog_width.tooltip", "How many chunks before the edge the fade starts."),
+                  ("sodium.options.mobile_lod_fog_width.value", "%s chunks"),
+              ])
+              add_options(fields, blocks, lang)
+              wr(P_DSI, s_dsi); wr(P_FSH, s_fsh)
+
+
           # ------------------------------------------------------------ mobile page
           def feature_tab():
               s = rd(P_CFG)
@@ -2074,7 +2655,7 @@ jobs:
           if os.path.exists("../applied_base.txt"):
               base = open("../applied_base.txt").read().strip()
 
-          features = (("flat", feature_flat), ("quad", feature_lod), ("ug", feature_underground), ("tab", feature_tab))
+          features = (("flat", feature_flat), ("quad", feature_lod), ("fog", feature_fog), ("ug", feature_underground), ("tab", feature_tab))
           if "all" in SKIP:
               features = ()
 
@@ -2084,11 +2665,11 @@ jobs:
                   continue
               # keep a copy so a half-applied feature can be rolled back
               backup = {}
-              for p in (P_OPTS, P_CFG, P_LANG, P_OCC, P_ABRC, P_FLUID, P_TASK, P_SECTION, P_COLLECTOR, P_RSM):
+              for p in (P_OPTS, P_CFG, P_LANG, P_OCC, P_ABRC, P_FLUID, P_TASK, P_SECTION, P_COLLECTOR, P_RSM, P_DSI, P_FSH):
                   backup[p] = rd(p)
               try:
                   fn()
-                  applied.append("quad13" if (name == "quad" and "quad4" in SKIP) else name)
+                  applied.append("quad13" if (name == "quad" and "quad15" in SKIP) else name)
                   print("APPLIED:", name)
               except Skip as e:
                   for p, c in backup.items():
@@ -2112,15 +2693,15 @@ jobs:
             cp -r snap sodium-mc1.21.11-0.8.14
             ( cd sodium-mc1.21.11-0.8.14 && MOBILE_V12_SKIP="$1" python3 ../v13.py && chmod +x gradlew && ./gradlew :fabric:build -Pbuild.release )
           }
-          build_attempt "" || build_attempt "quad4" || build_attempt "quad4,ug" || build_attempt "quad4,ug,quad" || build_attempt "all"
+          build_attempt "" || build_attempt "fog" || build_attempt "fog,quad15" || build_attempt "fog,quad15,ug" || build_attempt "fog,quad15,ug,quad" || build_attempt "all"
       - name: Collect jar
         run: |
           mkdir out
           JAR=$(ls sodium-mc1.21.11-0.8.14/build/mods/*.jar | head -1)
           TAG=$(cat applied.txt)
-          cp "$JAR" "out/sodium-mobile-1.4-${TAG}-mc1.21.11.jar"
+          cp "$JAR" "out/sodium-mobile-1.5-${TAG}-mc1.21.11.jar"
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: Sodium-Mobile-1.4
+          name: Sodium-Mobile-1.5
           path: out/*.jar
